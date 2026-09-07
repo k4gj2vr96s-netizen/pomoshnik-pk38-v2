@@ -1,8 +1,3 @@
 name = "pomoshnik-pk38-v2"
 main = "src/index.js"
 compatibility_date = "2026-09-07"
-
-[[d1_databases]]
-binding = "DB"
-database_name = "pk38-test-db"
-database_id = "5a75ce24-eca8-4eb5-a52b-df673f81ae71"
