@@ -1,3 +1,13 @@
+const TIMEZONE = "Europe/Simferopol";
+const ACADEMIC_YEAR = "2026-2027";
+const DUTY_START_DATE = "2026-09-02";
+const DUTY_GENERATE_DAYS = 60;
+
+
+/* =====================================================
+   WORKER
+===================================================== */
+
 export default {
   async fetch(request, env) {
     try {
@@ -33,6 +43,15 @@ export default {
       console.error("WORKER ERROR:", error);
       return new Response("OK");
     }
+  },
+
+
+  /* ===================================================
+     CRON
+  =================================================== */
+
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(runScheduledTasks(env));
   }
 };
 
@@ -66,6 +85,25 @@ async function handleMessage(message, env) {
 
   const telegramId = message.from.id;
   const text = message.text || "";
+
+  /*
+     Если сообщение пришло из группы —
+     автоматически запоминаем ID группы.
+  */
+  if (
+    message.chat &&
+    (
+      message.chat.type === "group" ||
+      message.chat.type === "supergroup"
+    )
+  ) {
+    await env.DB.prepare(
+      `INSERT OR REPLACE INTO settings (key, value)
+       VALUES ('group_chat_id', ?)`
+    )
+      .bind(String(message.chat.id))
+      .run();
+  }
 
   if (text === "/start") {
     await startCommand(message, env);
@@ -204,13 +242,11 @@ async function handleCallback(query, env) {
     callback_query_id: query.id
   }, env);
 
-  // Главное
   if (data === "today") {
     await showToday(chatId, telegramId, env);
     return;
   }
 
-  // Расписание
   if (data === "schedule") {
     await showSchedule(chatId, env);
     return;
@@ -222,13 +258,11 @@ async function handleCallback(query, env) {
     return;
   }
 
-  // Дежурство
   if (data === "duty") {
     await showDuty(chatId, telegramId, env);
     return;
   }
 
-  // Заглушки следующих разделов
   if (data === "homework") {
     await telegram("sendMessage", {
       chat_id: chatId,
@@ -282,13 +316,11 @@ async function handleCallback(query, env) {
     return;
   }
 
-  // Назад
   if (data === "back") {
     await showMainMenu(chatId, telegramId, env);
     return;
   }
 
-  // Админ
   if (data === "admin") {
     await showAdmin(chatId, telegramId, env);
     return;
@@ -367,35 +399,29 @@ async function showToday(chatId, telegramId, env) {
     .bind(telegramId)
     .first();
 
-  const now = new Date();
+  const dateString = getLocalDate();
 
-  // Европа/Симферополь: определяем день недели
-  const dateString = new Intl.DateTimeFormat("en-CA", {
-    timeZone: "Europe/Simferopol"
-  }).format(now);
-
-  const weekday = Number(
-    new Intl.DateTimeFormat("en-US", {
-      timeZone: "Europe/Simferopol",
-      weekday: "numeric"
-    }).format(now)
-  );
-
-  // JS getDay() через локальную дату
-  const localDate = new Date(`${dateString}T12:00:00`);
-  const day = localDate.getDay();
+  const day = getDayOfWeek(dateString);
 
   if (day === 0 || day === 6) {
     await telegram("sendMessage", {
       chat_id: chatId,
-      text: `🏠 Сегодня выходной.\n\n📅 ${formatDate(dateString)}`,
+      text:
+        `🏠 Сегодня выходной.\n\n` +
+        `📅 ${formatDate(dateString)}`,
       reply_markup: backMenu()
     }, env);
 
     return;
   }
 
-  await showScheduleDay(chatId, day, env, dateString, student);
+  await showScheduleDay(
+    chatId,
+    day,
+    env,
+    dateString,
+    student
+  );
 }
 
 
@@ -436,7 +462,12 @@ async function showSchedule(chatId, env) {
    SCHEDULE DAY
 ===================================================== */
 
-async function showScheduleDay(chatId, day, env, specificDate = null) {
+async function showScheduleDay(
+  chatId,
+  day,
+  env,
+  specificDate = null
+) {
   const dayNames = {
     1: "Понедельник",
     2: "Вторник",
@@ -464,10 +495,10 @@ async function showScheduleDay(chatId, day, env, specificDate = null) {
             room
      FROM schedule
      WHERE day_of_week = ?
-       AND academic_year = '2026-2027'
+       AND academic_year = ?
      ORDER BY lesson_number`
   )
-    .bind(day)
+    .bind(day, ACADEMIC_YEAR)
     .all();
 
   if (!result.results.length) {
@@ -531,7 +562,8 @@ async function showDuty(chatId, telegramId, env) {
     return;
   }
 
-  // Ищем ближайшее будущее дежурство
+  const today = getLocalDate();
+
   const duty = await env.DB.prepare(
     `SELECT
         d.id,
@@ -545,11 +577,11 @@ async function showDuty(chatId, telegramId, env) {
      LEFT JOIN students s2 ON d.student2_id = s2.id
      WHERE (d.student1_id = ? OR d.student2_id = ?)
        AND d.status != 'cancelled'
-       AND d.duty_date >= date('now', 'localtime')
+       AND d.duty_date >= ?
      ORDER BY d.duty_date ASC
      LIMIT 1`
   )
-    .bind(student.id, student.id)
+    .bind(student.id, student.id, today)
     .first();
 
   if (!duty) {
@@ -568,11 +600,38 @@ async function showDuty(chatId, telegramId, env) {
     `🧹 Твоё ближайшее дежурство\n\n` +
     `📅 Дата: ${formatDate(duty.duty_date)}\n` +
     `👥 Пара №${duty.pair_number}\n\n` +
-    `👤 ${duty.student1}\n` +
-    `👤 ${duty.student2}`;
+    `👤 ${duty.student1 || "—"}\n` +
+    `👤 ${duty.student2 || "—"}`;
 
-  if (duty.duty_date === "2026-09-07") {
-    text += `\n\n🔄 На эту дату действует замена:\nФролов Никита → Хомченко Степан`;
+  const history = await env.DB.prepare(
+    `SELECT
+        old_student_id,
+        new_student_id,
+        reason
+     FROM duty_history
+     WHERE duty_id = ?
+     ORDER BY changed_at DESC
+     LIMIT 1`
+  )
+    .bind(duty.id)
+    .first();
+
+  if (history) {
+    const oldStudent = await env.DB.prepare(
+      `SELECT full_name FROM students WHERE id = ?`
+    )
+      .bind(history.old_student_id)
+      .first();
+
+    const newStudent = await env.DB.prepare(
+      `SELECT full_name FROM students WHERE id = ?`
+    )
+      .bind(history.new_student_id)
+      .first();
+
+    text +=
+      `\n\n🔄 На эту дату действует замена:\n` +
+      `${oldStudent?.full_name || "—"} → ${newStudent?.full_name || "—"}`;
   }
 
   await telegram("sendMessage", {
@@ -581,10 +640,16 @@ async function showDuty(chatId, telegramId, env) {
     reply_markup: {
       inline_keyboard: [
         [
-          { text: "🔄 Попросить замену", callback_data: "replacement" }
+          {
+            text: "🔄 Попросить замену",
+            callback_data: "replacement"
+          }
         ],
         [
-          { text: "◀️ Назад", callback_data: "back" }
+          {
+            text: "◀️ Назад",
+            callback_data: "back"
+          }
         ]
       ]
     }
@@ -605,7 +670,10 @@ async function showAdmin(chatId, telegramId, env) {
     .bind(telegramId)
     .first();
 
-  if (!student || (student.role !== "admin" && student.role !== "deputy")) {
+  if (
+    !student ||
+    (student.role !== "admin" && student.role !== "deputy")
+  ) {
     await telegram("sendMessage", {
       chat_id: chatId,
       text: "⛔ У тебя нет доступа к админ-панели."
@@ -665,7 +733,10 @@ async function showAdminDuties(chatId, telegramId, env) {
     .bind(telegramId)
     .first();
 
-  if (!admin || (admin.role !== "admin" && admin.role !== "deputy")) {
+  if (
+    !admin ||
+    (admin.role !== "admin" && admin.role !== "deputy")
+  ) {
     await telegram("sendMessage", {
       chat_id: chatId,
       text: "⛔ Нет доступа."
@@ -685,7 +756,7 @@ async function showAdminDuties(chatId, telegramId, env) {
      LEFT JOIN students s1 ON d.student1_id = s1.id
      LEFT JOIN students s2 ON d.student2_id = s2.id
      ORDER BY d.duty_date ASC
-     LIMIT 20`
+     LIMIT 50`
   ).all();
 
   let text = "🧹 Дежурства\n\n";
@@ -727,7 +798,10 @@ async function showAdminStudents(chatId, telegramId, env) {
     .bind(telegramId)
     .first();
 
-  if (!admin || (admin.role !== "admin" && admin.role !== "deputy")) {
+  if (
+    !admin ||
+    (admin.role !== "admin" && admin.role !== "deputy")
+  ) {
     await telegram("sendMessage", {
       chat_id: chatId,
       text: "⛔ Нет доступа."
@@ -743,7 +817,9 @@ async function showAdminStudents(chatId, telegramId, env) {
      ORDER BY full_name`
   ).all();
 
-  let text = `👥 Участники ПК-38\n\nКоличество: ${result.results.length}\n\n`;
+  let text =
+    `👥 Участники ПК-38\n\n` +
+    `Количество: ${result.results.length}\n\n`;
 
   for (const student of result.results) {
     const telegramStatus = student.telegram_id
@@ -785,7 +861,10 @@ async function adminPlaceholder(chatId, title, env) {
     reply_markup: {
       inline_keyboard: [
         [
-          { text: "◀️ В админ-панель", callback_data: "admin" }
+          {
+            text: "◀️ В админ-панель",
+            callback_data: "admin"
+          }
         ]
       ]
     }
@@ -801,7 +880,10 @@ function backMenu() {
   return {
     inline_keyboard: [
       [
-        { text: "◀️ Назад", callback_data: "back" }
+        {
+          text: "◀️ Назад",
+          callback_data: "back"
+        }
       ]
     ]
   };
@@ -809,15 +891,467 @@ function backMenu() {
 
 
 /* =====================================================
-   HELPERS
+   AUTOMATIC DUTIES
 ===================================================== */
+
+async function generateDuties(env) {
+  const pairs = await env.DB.prepare(
+    `SELECT
+       pair_number,
+       student1_id,
+       student2_id
+     FROM duty_pairs
+     WHERE active = 1
+     ORDER BY pair_number`
+  ).all();
+
+  if (!pairs.results.length) {
+    console.error("No active duty pairs found");
+    return;
+  }
+
+  /*
+     Смотрим последнюю уже созданную дату.
+     Это позволяет продолжить очередь,
+     а не начинать её заново.
+  */
+  const lastDuty = await env.DB.prepare(
+    `SELECT duty_date, pair_number
+     FROM duties
+     ORDER BY duty_date DESC
+     LIMIT 1`
+  ).first();
+
+  let currentDate;
+  let nextPairNumber;
+
+  if (lastDuty) {
+    currentDate = addDays(lastDuty.duty_date, 1);
+
+    nextPairNumber =
+      Number(lastDuty.pair_number) + 1;
+
+    if (nextPairNumber > pairs.results.length) {
+      nextPairNumber = 1;
+    }
+  } else {
+    currentDate = DUTY_START_DATE;
+    nextPairNumber = 1;
+  }
+
+  const today = getLocalDate();
+
+  /*
+     Если база почему-то ещё пустая и стартовая дата
+     уже прошла — всё равно начинаем со стартовой даты.
+  */
+  if (!lastDuty && currentDate < DUTY_START_DATE) {
+    currentDate = DUTY_START_DATE;
+  }
+
+  /*
+     Генерируем вперёд.
+  */
+  const generationEnd = addDays(
+    today > currentDate ? today : currentDate,
+    DUTY_GENERATE_DAYS
+  );
+
+  let generated = 0;
+
+  while (currentDate <= generationEnd) {
+    const day = getDayOfWeek(currentDate);
+
+    // Суббота и воскресенье
+    if (day !== 0 && day !== 6) {
+      const calendar = await env.DB.prepare(
+        `SELECT status
+         FROM calendar
+         WHERE calendar_date = ?`
+      )
+        .bind(currentDate)
+        .first();
+
+      const isCalendarDayOff =
+        calendar &&
+        (
+          calendar.status === "holiday" ||
+          calendar.status === "vacation" ||
+          calendar.status === "cancelled" ||
+          calendar.status === "weekend" ||
+          calendar.status === "day_off"
+        );
+
+      if (!isCalendarDayOff) {
+        const existing = await env.DB.prepare(
+          `SELECT id
+           FROM duties
+           WHERE duty_date = ?`
+        )
+          .bind(currentDate)
+          .first();
+
+        /*
+           Если дежурство уже есть —
+           ничего не меняем и очередь не двигаем.
+        */
+        if (!existing) {
+          const pair = pairs.results.find(
+            p => Number(p.pair_number) === nextPairNumber
+          );
+
+          if (pair) {
+            await env.DB.prepare(
+              `INSERT INTO duties
+               (duty_date,
+                pair_number,
+                student1_id,
+                student2_id,
+                status)
+               VALUES (?, ?, ?, ?, 'scheduled')`
+            )
+              .bind(
+                currentDate,
+                pair.pair_number,
+                pair.student1_id,
+                pair.student2_id
+              )
+              .run();
+
+            generated++;
+
+            nextPairNumber++;
+
+            if (nextPairNumber > pairs.results.length) {
+              nextPairNumber = 1;
+            }
+          }
+        }
+      }
+    }
+
+    currentDate = addDays(currentDate, 1);
+  }
+
+  console.log(
+    `Duties generated: ${generated}`
+  );
+}
+
+
+/* =====================================================
+   GET TODAY'S DUTY
+===================================================== */
+
+async function getTodayDuty(env) {
+  const today = getLocalDate();
+
+  return await env.DB.prepare(
+    `SELECT
+       d.id,
+       d.duty_date,
+       d.pair_number,
+       d.student1_id,
+       d.student2_id,
+       d.status,
+       s1.full_name AS student1,
+       s2.full_name AS student2
+     FROM duties d
+     LEFT JOIN students s1
+       ON d.student1_id = s1.id
+     LEFT JOIN students s2
+       ON d.student2_id = s2.id
+     WHERE d.duty_date = ?
+       AND d.status != 'cancelled'
+     LIMIT 1`
+  )
+    .bind(today)
+    .first();
+}
+
+
+/* =====================================================
+   SEND DUTY MESSAGE
+===================================================== */
+
+async function sendDutyNotification(env, type) {
+  const setting = await env.DB.prepare(
+    `SELECT value
+     FROM settings
+     WHERE key = 'group_chat_id'`
+  ).first();
+
+  if (!setting || !setting.value) {
+    console.log("Group chat ID not saved yet");
+    return;
+  }
+
+  const duty = await getTodayDuty(env);
+
+  if (!duty) {
+    console.log("No duty today");
+    return;
+  }
+
+  const today = getLocalDate();
+
+  const history = await env.DB.prepare(
+    `SELECT
+       old_student_id,
+       new_student_id
+     FROM duty_history
+     WHERE duty_id = ?
+     ORDER BY changed_at DESC
+     LIMIT 1`
+  )
+    .bind(duty.id)
+    .first();
+
+  let student1 = duty.student1;
+  let student2 = duty.student2;
+
+  let replacementText = "";
+
+  if (history) {
+    const oldStudent = await env.DB.prepare(
+      `SELECT full_name
+       FROM students
+       WHERE id = ?`
+    )
+      .bind(history.old_student_id)
+      .first();
+
+    const newStudent = await env.DB.prepare(
+      `SELECT full_name
+       FROM students
+       WHERE id = ?`
+    )
+      .bind(history.new_student_id)
+      .first();
+
+    if (oldStudent && newStudent) {
+      if (student1 === oldStudent.full_name) {
+        student1 = newStudent.full_name;
+      }
+
+      if (student2 === oldStudent.full_name) {
+        student2 = newStudent.full_name;
+      }
+
+      replacementText =
+        `\n\n🔄 Замена:\n` +
+        `${oldStudent.full_name} → ${newStudent.full_name}`;
+    }
+  }
+
+  let text;
+
+  if (type === "morning") {
+    text =
+      `☀️ ДОБРОЕ УТРО, ПК-38!\n\n` +
+      `🧹 Сегодня дежурят:\n\n` +
+      `👤 ${student1 || "—"}\n` +
+      `👤 ${student2 || "—"}\n\n` +
+      `📅 ${formatDate(today)}` +
+      replacementText;
+  } else {
+    text =
+      `⏰ НАПОМИНАНИЕ О ДЕЖУРСТВЕ\n\n` +
+      `Сегодня дежурят:\n\n` +
+      `👤 ${student1 || "—"}\n` +
+      `👤 ${student2 || "—"}\n\n` +
+      `Не забудьте выполнить дежурство после занятий.` +
+      replacementText;
+  }
+
+  await telegram("sendMessage", {
+    chat_id: setting.value,
+    text
+  }, env);
+
+  console.log(
+    `Sent ${type} notification for ${today}`
+  );
+}
+
+
+/* =====================================================
+   SCHEDULED TASKS
+===================================================== */
+
+async function runScheduledTasks(env) {
+  try {
+    /*
+       Сначала обеспечиваем наличие будущих
+       дежурств.
+    */
+    await generateDuties(env);
+
+    const now = getLocalTime();
+    const today = getLocalDate();
+
+    /*
+       07:00
+    */
+    if (now.hour === 7 && now.minute === 0) {
+      const key = "last_morning_notification";
+
+      const setting = await env.DB.prepare(
+        `SELECT value
+         FROM settings
+         WHERE key = ?`
+      )
+        .bind(key)
+        .first();
+
+      if (!setting || setting.value !== today) {
+        await sendDutyNotification(env, "morning");
+
+        await env.DB.prepare(
+          `INSERT OR REPLACE INTO settings
+           (key, value)
+           VALUES (?, ?)`
+        )
+          .bind(key, today)
+          .run();
+      }
+    }
+
+    /*
+       12:00
+    */
+    if (now.hour === 12 && now.minute === 0) {
+      const key = "last_duty_reminder";
+
+      const setting = await env.DB.prepare(
+        `SELECT value
+         FROM settings
+         WHERE key = ?`
+      )
+        .bind(key)
+        .first();
+
+      if (!setting || setting.value !== today) {
+        await sendDutyNotification(env, "reminder");
+
+        await env.DB.prepare(
+          `INSERT OR REPLACE INTO settings
+           (key, value)
+           VALUES (?, ?)`
+        )
+          .bind(key, today)
+          .run();
+      }
+    }
+
+  } catch (error) {
+    console.error(
+      "SCHEDULED TASK ERROR:",
+      error
+    );
+  }
+}
+
+
+/* =====================================================
+   DATE / TIME HELPERS
+===================================================== */
+
+function getLocalDate() {
+  const parts = new Intl.DateTimeFormat(
+    "en-US",
+    {
+      timeZone: TIMEZONE,
+      year: "numeric",
+      month: "2-digit",
+      day: "2-digit"
+    }
+  ).formatToParts(new Date());
+
+  const year = parts.find(
+    p => p.type === "year"
+  ).value;
+
+  const month = parts.find(
+    p => p.type === "month"
+  ).value;
+
+  const day = parts.find(
+    p => p.type === "day"
+  ).value;
+
+  return `${year}-${month}-${day}`;
+}
+
+
+function getLocalTime() {
+  const parts = new Intl.DateTimeFormat(
+    "en-US",
+    {
+      timeZone: TIMEZONE,
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false
+    }
+  ).formatToParts(new Date());
+
+  let hour = Number(
+    parts.find(p => p.type === "hour").value
+  );
+
+  const minute = Number(
+    parts.find(p => p.type === "minute").value
+  );
+
+  /*
+     Некоторые JS-реализации могут вернуть 24
+     вместо 00.
+  */
+  if (hour === 24) {
+    hour = 0;
+  }
+
+  return {
+    hour,
+    minute
+  };
+}
+
+
+function getDayOfWeek(dateString) {
+  const [year, month, day] =
+    dateString.split("-").map(Number);
+
+  return new Date(
+    Date.UTC(year, month - 1, day)
+  ).getUTCDay();
+}
+
+
+function addDays(dateString, days) {
+  const [year, month, day] =
+    dateString.split("-").map(Number);
+
+  const date = new Date(
+    Date.UTC(year, month - 1, day)
+  );
+
+  date.setUTCDate(
+    date.getUTCDate() + days
+  );
+
+  return date.toISOString().slice(0, 10);
+}
+
 
 function formatDate(date) {
   if (!date) return "";
 
   const parts = date.split("-");
 
-  if (parts.length !== 3) return date;
+  if (parts.length !== 3) {
+    return date;
+  }
 
   return `${parts[2]}.${parts[1]}.${parts[0]}`;
 }
