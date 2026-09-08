@@ -141,42 +141,6 @@ async function handleMessage(message, env) {
 
 async function startCommand(message, env) {
   const telegramId = message.from.id;
-  const username = message.from.username || null;
-
-  const student = await env.DB.prepare(
-    `SELECT * FROM students WHERE telegram_id = ?`
-  )
-    .bind(telegramId)
-    .first();
-
-  if (student) {
-    // Обновляем username, если он изменился
-    await env.DB.prepare(
-      `UPDATE students
-       SET username = ?
-       WHERE id = ?`
-    )
-      .bind(username, student.id)
-      .run();
-
-    student.username = username;
-
-    await sendMainMenu(message.chat.id, student, env);
-    return;
-  }
-
-  await telegram("sendMessage", {
-    chat_id: message.chat.id,
-    text:
-      `👋 Привет!\n\n` +
-      `Это «Помощник ПК-38».\n\n` +
-      `🔗 Чтобы привязать твой Telegram к группе, ` +
-      `нужен одноразовый код от старосты или заместителя.\n\n` +
-      `Отправь сюда полученный код из 6 цифр.\n\n` +
-      `Например: 482731`
-  }, env);
-}
-  const telegramId = message.from.id;
 
   const student = await env.DB.prepare(
     `SELECT * FROM students WHERE telegram_id = ?`
