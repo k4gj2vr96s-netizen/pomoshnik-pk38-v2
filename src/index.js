@@ -2,6 +2,7 @@ const TIMEZONE = "Europe/Simferopol";
 const ACADEMIC_YEAR = "2026-2027";
 const DUTY_START_DATE = "2026-09-02";
 const DUTY_GENERATE_DAYS = 60;
+const LINK_CODE_TTL_MINUTES = 15;
 
 /* =====================================================
    WORKER
@@ -35,7 +36,6 @@ export default {
       }
 
       return new Response("OK");
-
     } catch (error) {
       console.error("WORKER ERROR:", error);
       return new Response("OK");
@@ -78,6 +78,7 @@ async function handleMessage(message, env) {
   const telegramId = message.from.id;
   const text = (message.text || "").trim();
 
+  /* Сохраняем ID группы */
   if (
     message.chat &&
     (
@@ -102,9 +103,10 @@ async function handleMessage(message, env) {
     await telegram("sendMessage", {
       chat_id: message.chat.id,
       text:
-        `🆔 Ваш Telegram ID:\n\n` +
+        `🆔 Твой Telegram ID:\n\n` +
         `${telegramId}\n\n` +
-        `Имя: ${message.from.first_name || ""}`
+        `ℹ️ Для привязки этот ID передавать не нужно.\n` +
+        `Староста или заместитель выдаёт одноразовый код.`
     }, env);
 
     return;
@@ -122,6 +124,23 @@ async function handleMessage(message, env) {
     return;
   }
 
+  /*
+     Код привязки обрабатываем только в личном чате.
+  */
+  if (
+    /^\d{6}$/.test(text) &&
+    message.chat &&
+    message.chat.type === "private"
+  ) {
+    const linked = await processTelegramLinkCode(
+      message,
+      text,
+      env
+    );
+
+    if (linked) return;
+  }
+
   const handledInput = await handlePendingInput(
     message,
     telegramId,
@@ -131,7 +150,11 @@ async function handleMessage(message, env) {
 
   if (handledInput) return;
 
-  await showMainMenu(message.chat.id, telegramId, env);
+  await showMainMenu(
+    message.chat.id,
+    telegramId,
+    env
+  );
 }
 
 
@@ -141,28 +164,201 @@ async function handleMessage(message, env) {
 
 async function startCommand(message, env) {
   const telegramId = message.from.id;
+  const username = message.from.username || null;
 
   const student = await env.DB.prepare(
-    `SELECT * FROM students WHERE telegram_id = ?`
+    `SELECT *
+     FROM students
+     WHERE telegram_id = ?`
   )
     .bind(telegramId)
+    .first();
+
+  if (student) {
+    await env.DB.prepare(
+      `UPDATE students
+       SET username = ?
+       WHERE id = ?`
+    )
+      .bind(username, student.id)
+      .run();
+
+    student.username = username;
+
+    await sendMainMenu(
+      message.chat.id,
+      student,
+      env
+    );
+
+    return;
+  }
+
+  await telegram("sendMessage", {
+    chat_id: message.chat.id,
+    text:
+      `👋 Привет!\n\n` +
+      `Это «Помощник ПК-38».\n\n` +
+      `🔗 Твой Telegram пока не привязан к списку группы.\n\n` +
+      `Попроси старосту или заместителя выдать тебе ` +
+      `одноразовый код из 6 цифр.\n\n` +
+      `После этого просто отправь код сюда.\n\n` +
+      `Например:\n482731`
+  }, env);
+}
+
+
+/* =====================================================
+   TELEGRAM LINK CODE
+===================================================== */
+
+async function processTelegramLinkCode(
+  message,
+  code,
+  env
+) {
+  const telegramId = message.from.id;
+  const username = message.from.username || null;
+
+  const linkCode = await env.DB.prepare(
+    `SELECT
+       code,
+       student_id,
+       expires_at,
+       used_at
+     FROM link_codes
+     WHERE code = ?`
+  )
+    .bind(code)
+    .first();
+
+  if (!linkCode) {
+    await telegram("sendMessage", {
+      chat_id: message.chat.id,
+      text:
+        `❌ Такой код не найден.\n\n` +
+        `Проверь код и отправь его ещё раз.`
+    }, env);
+
+    return true;
+  }
+
+  if (linkCode.used_at) {
+    await telegram("sendMessage", {
+      chat_id: message.chat.id,
+      text:
+        `❌ Этот код уже использован.\n\n` +
+        `Попроси новый код у старосты или заместителя.`
+    }, env);
+
+    return true;
+  }
+
+  const expiresAt =
+    new Date(linkCode.expires_at).getTime();
+
+  if (
+    !Number.isFinite(expiresAt) ||
+    expiresAt < Date.now()
+  ) {
+    await telegram("sendMessage", {
+      chat_id: message.chat.id,
+      text:
+        `⏰ Срок действия этого кода истёк.\n\n` +
+        `Попроси старосту или заместителя выдать новый.`
+    }, env);
+
+    return true;
+  }
+
+  const existingStudent = await env.DB.prepare(
+    `SELECT id, full_name
+     FROM students
+     WHERE telegram_id = ?`
+  )
+    .bind(telegramId)
+    .first();
+
+  if (
+    existingStudent &&
+    Number(existingStudent.id) !==
+      Number(linkCode.student_id)
+  ) {
+    await telegram("sendMessage", {
+      chat_id: message.chat.id,
+      text:
+        `⚠️ Этот Telegram уже привязан к другому участнику группы.\n\n` +
+        `Обратись к старосте.`
+    }, env);
+
+    return true;
+  }
+
+  const student = await env.DB.prepare(
+    `SELECT
+       id,
+       full_name,
+       role
+     FROM students
+     WHERE id = ?`
+  )
+    .bind(linkCode.student_id)
     .first();
 
   if (!student) {
     await telegram("sendMessage", {
       chat_id: message.chat.id,
       text:
-        `👋 Привет!\n\n` +
-        `Это тестовая версия «Помощника ПК-38».\n\n` +
-        `🆔 Твой Telegram ID:\n${telegramId}\n\n` +
-        `Пока твой Telegram не привязан к списку группы.\n` +
-        `Передай этот ID старосте.`
+        `❌ Участник для этого кода не найден.\n\n` +
+        `Попроси создать новый код.`
     }, env);
 
-    return;
+    return true;
   }
 
-  await sendMainMenu(message.chat.id, student, env);
+  await env.DB.prepare(
+    `UPDATE students
+     SET
+       telegram_id = ?,
+       username = ?
+     WHERE id = ?`
+  )
+    .bind(
+      telegramId,
+      username,
+      student.id
+    )
+    .run();
+
+  await env.DB.prepare(
+    `UPDATE link_codes
+     SET used_at = CURRENT_TIMESTAMP
+     WHERE code = ?`
+  )
+    .bind(code)
+    .run();
+
+  await telegram("sendMessage", {
+    chat_id: message.chat.id,
+    text:
+      `✅ Telegram успешно привязан!\n\n` +
+      `👤 ${student.full_name}\n\n` +
+      `Теперь тебе доступны функции «Помощника ПК-38».`
+  }, env);
+
+  await sendMainMenu(
+    message.chat.id,
+    {
+      id: student.id,
+      full_name: student.full_name,
+      role: student.role,
+      telegram_id: telegramId,
+      username
+    },
+    env
+  );
+
+  return true;
 }
 
 
@@ -170,9 +366,15 @@ async function startCommand(message, env) {
    MAIN MENU
 ===================================================== */
 
-async function showMainMenu(chatId, telegramId, env) {
+async function showMainMenu(
+  chatId,
+  telegramId,
+  env
+) {
   const student = await env.DB.prepare(
-    `SELECT * FROM students WHERE telegram_id = ?`
+    `SELECT *
+     FROM students
+     WHERE telegram_id = ?`
   )
     .bind(telegramId)
     .first();
@@ -182,17 +384,26 @@ async function showMainMenu(chatId, telegramId, env) {
       chat_id: chatId,
       text:
         `❗ Ты пока не привязан к группе.\n\n` +
-        `Используй /id и передай ID старосте.`
+        `Нажми /start и попроси у старосты ` +
+        `одноразовый код.`
     }, env);
 
     return;
   }
 
-  await sendMainMenu(chatId, student, env);
+  await sendMainMenu(
+    chatId,
+    student,
+    env
+  );
 }
 
 
-async function sendMainMenu(chatId, student, env) {
+async function sendMainMenu(
+  chatId,
+  student,
+  env
+) {
   await telegram("sendMessage", {
     chat_id: chatId,
     text:
@@ -206,26 +417,52 @@ async function sendMainMenu(chatId, student, env) {
 function mainMenu(role) {
   const keyboard = [
     [
-      { text: "☀️ Сегодня", callback_data: "today" },
-      { text: "📅 Расписание", callback_data: "schedule" }
+      {
+        text: "☀️ Сегодня",
+        callback_data: "today"
+      },
+      {
+        text: "📅 Расписание",
+        callback_data: "schedule"
+      }
     ],
     [
-      { text: "📚 ДЗ", callback_data: "homework" },
-      { text: "🧹 Дежурство", callback_data: "duty" }
+      {
+        text: "📚 ДЗ",
+        callback_data: "homework"
+      },
+      {
+        text: "🧹 Дежурство",
+        callback_data: "duty"
+      }
     ],
     [
-      { text: "🔄 Попросить замену", callback_data: "replacement" },
-      { text: "⏰ Я опоздаю", callback_data: "late" }
+      {
+        text: "📊 Моя статистика",
+        callback_data: "stats"
+      },
+      {
+        text: "📢 Объявления",
+        callback_data: "announcements"
+      }
     ],
     [
-      { text: "📊 Моя статистика", callback_data: "stats" },
-      { text: "📢 Объявления", callback_data: "announcements" }
+      {
+        text: "⏰ Я опоздаю",
+        callback_data: "late"
+      }
     ]
   ];
 
-  if (role === "admin" || role === "deputy") {
+  if (
+    role === "admin" ||
+    role === "deputy"
+  ) {
     keyboard.push([
-      { text: "👑 Админ-панель", callback_data: "admin" }
+      {
+        text: "👑 Админ-панель",
+        callback_data: "admin"
+      }
     ]);
   }
 
@@ -239,54 +476,99 @@ function mainMenu(role) {
    CALLBACKS
 ===================================================== */
 
-async function handleCallback(query, env) {
+async function handleCallback(
+  query,
+  env
+) {
   if (!query.message) return;
 
-  const chatId = query.message.chat.id;
-  const telegramId = query.from.id;
-  const data = query.data || "";
+  const chatId =
+    query.message.chat.id;
 
-  await telegram("answerCallbackQuery", {
-    callback_query_id: query.id
-  }, env);
+  const telegramId =
+    query.from.id;
+
+  const data =
+    query.data || "";
+
+  await telegram(
+    "answerCallbackQuery",
+    {
+      callback_query_id: query.id
+    },
+    env
+  );
 
   /* ---------- STUDENT ---------- */
 
   if (data === "today") {
-    await showToday(chatId, telegramId, env);
+    await showToday(
+      chatId,
+      telegramId,
+      env
+    );
     return;
   }
 
   if (data === "schedule") {
-    await showSchedule(chatId, env);
+    await showSchedule(
+      chatId,
+      env
+    );
     return;
   }
 
   if (data.startsWith("day_")) {
-    const day = Number(data.replace("day_", ""));
-    await showScheduleDay(chatId, day, env);
+    const day =
+      Number(
+        data.replace(
+          "day_",
+          ""
+        )
+      );
+
+    await showScheduleDay(
+      chatId,
+      day,
+      env
+    );
+
     return;
   }
 
   if (data === "today_schedule") {
-    await showToday(chatId, telegramId, env);
+    await showToday(
+      chatId,
+      telegramId,
+      env
+    );
     return;
   }
 
   if (data === "current_lesson") {
-    await showCurrentLesson(chatId, env);
+    await showCurrentLesson(
+      chatId,
+      env
+    );
     return;
   }
 
   if (data === "duty") {
-    await showDuty(chatId, telegramId, env);
+    await showDuty(
+      chatId,
+      telegramId,
+      env
+    );
     return;
   }
 
   /* ---------- HOMEWORK ---------- */
 
   if (data === "homework") {
-    await showHomeworkMenu(chatId, env);
+    await showHomeworkMenu(
+      chatId,
+      env
+    );
     return;
   }
 
@@ -296,11 +578,19 @@ async function handleCallback(query, env) {
     data === "hw_week" ||
     data === "hw_all"
   ) {
-    await showHomework(chatId, data.replace("hw_", ""), env);
+    await showHomework(
+      chatId,
+      data.replace(
+        "hw_",
+        ""
+      ),
+      env
+    );
+
     return;
   }
 
-  /* ---------- OTHER STUDENT ---------- */
+  /* ---------- OTHER ---------- */
 
   if (data === "replacement") {
     await telegram("sendMessage", {
@@ -310,6 +600,7 @@ async function handleCallback(query, env) {
         `Функция замены будет подключена следующим этапом.`,
       reply_markup: backMenu()
     }, env);
+
     return;
   }
 
@@ -321,6 +612,7 @@ async function handleCallback(query, env) {
         `Функция уведомления об опоздании будет подключена следующим этапом.`,
       reply_markup: backMenu()
     }, env);
+
     return;
   }
 
@@ -332,6 +624,7 @@ async function handleCallback(query, env) {
         `Статистика будет подключена следующим этапом.`,
       reply_markup: backMenu()
     }, env);
+
     return;
   }
 
@@ -343,11 +636,17 @@ async function handleCallback(query, env) {
         `Пока опубликованных объявлений нет.`,
       reply_markup: backMenu()
     }, env);
+
     return;
   }
 
   if (data === "back") {
-    await showMainMenu(chatId, telegramId, env);
+    await showMainMenu(
+      chatId,
+      telegramId,
+      env
+    );
+
     return;
   }
 
@@ -356,67 +655,225 @@ async function handleCallback(query, env) {
   =================================================== */
 
   if (data === "admin") {
-    await showAdmin(chatId, telegramId, env);
+    await showAdmin(
+      chatId,
+      telegramId,
+      env
+    );
+
     return;
   }
 
   if (data === "admin_duties") {
-    await showAdminDuties(chatId, telegramId, env);
+    await showAdminDuties(
+      chatId,
+      telegramId,
+      env
+    );
+
     return;
   }
 
   if (data === "admin_students") {
-    await showAdminStudents(chatId, telegramId, env);
+    await showAdminStudents(
+      chatId,
+      telegramId,
+      env
+    );
+
+    return;
+  }
+
+  if (data.startsWith("admin_student_")) {
+    const id =
+      Number(
+        data.replace(
+          "admin_student_",
+          ""
+        )
+      );
+
+    await showAdminStudent(
+      chatId,
+      telegramId,
+      id,
+      env
+    );
+
+    return;
+  }
+
+  if (data.startsWith("student_link_")) {
+    const id =
+      Number(
+        data.replace(
+          "student_link_",
+          ""
+        )
+      );
+
+    await createTelegramLinkCode(
+      chatId,
+      telegramId,
+      id,
+      env
+    );
+
+    return;
+  }
+
+  if (data.startsWith("student_unlink_")) {
+    const id =
+      Number(
+        data.replace(
+          "student_unlink_",
+          ""
+        )
+      );
+
+    await unlinkTelegram(
+      chatId,
+      telegramId,
+      id,
+      env
+    );
+
     return;
   }
 
   if (data === "admin_calendar") {
-    await adminPlaceholder(chatId, "📅 Календарь", env);
+    await adminPlaceholder(
+      chatId,
+      "📅 Календарь",
+      env
+    );
+
     return;
   }
 
   if (data === "admin_schedule") {
-    await showAdminSchedule(chatId, telegramId, env);
+    await showAdminSchedule(
+      chatId,
+      telegramId,
+      env
+    );
+
     return;
   }
 
   if (data === "admin_homework") {
-    await showAdminHomework(chatId, telegramId, env);
+    await showAdminHomework(
+      chatId,
+      telegramId,
+      env
+    );
+
     return;
   }
 
   if (data === "admin_announcements") {
-    await adminPlaceholder(chatId, "📢 Управление объявлениями", env);
+    await adminPlaceholder(
+      chatId,
+      "📢 Управление объявлениями",
+      env
+    );
+
+    return;
+  }
+
+  if (data === "admin_alerts") {
+    await showAdminAlerts(
+      chatId,
+      telegramId,
+      env
+    );
+
     return;
   }
 
   if (data === "admin_attendance") {
-    await adminPlaceholder(chatId, "🕐 Посещаемость", env);
+    await adminPlaceholder(
+      chatId,
+      "🕐 Посещаемость",
+      env
+    );
+
     return;
   }
 
   if (data === "admin_replacements") {
-    await adminPlaceholder(chatId, "🔄 Замены", env);
+    await adminPlaceholder(
+      chatId,
+      "🔄 Замены",
+      env
+    );
+
     return;
   }
 
   if (data === "admin_stats") {
-    await adminPlaceholder(chatId, "📊 Статистика группы", env);
+    await adminPlaceholder(
+      chatId,
+      "📊 Статистика группы",
+      env
+    );
+
     return;
   }
 
   if (data === "admin_year") {
-    await adminPlaceholder(chatId, "🎓 Учебный год", env);
+    await adminPlaceholder(
+      chatId,
+      "🎓 Учебный год",
+      env
+    );
+
     return;
   }
 
   if (data === "admin_settings") {
-    await adminPlaceholder(chatId, "⚙️ Настройки", env);
+    await adminPlaceholder(
+      chatId,
+      "⚙️ Настройки",
+      env
+    );
+
     return;
   }
 
   if (data === "admin_backup") {
-    await adminPlaceholder(chatId, "💾 Резервная копия", env);
+    await adminPlaceholder(
+      chatId,
+      "💾 Резервная копия",
+      env
+    );
+
+    return;
+  }
+
+  /* ===================================================
+     ADMIN ALERTS
+  =================================================== */
+
+  if (data === "alert_air") {
+    await sendManualAlert(
+      chatId,
+      telegramId,
+      "air",
+      env
+    );
+
+    return;
+  }
+
+  if (data === "alert_end_air") {
+    await sendManualAlert(
+      chatId,
+      telegramId,
+      "end_air",
+      env
+    );
+
     return;
   }
 
@@ -425,12 +882,14 @@ async function handleCallback(query, env) {
   =================================================== */
 
   if (data === "hw_admin_add") {
-    if (!(await isAdmin(telegramId, env))) return;
+    if (!(await isAdmin(telegramId, env))) {
+      return;
+    }
 
     await beginPendingInput(
       telegramId,
       "hw_add_date",
-      { },
+      {},
       env
     );
 
@@ -449,31 +908,88 @@ async function handleCallback(query, env) {
   }
 
   if (data === "hw_admin_list") {
-    await showAdminHomeworkList(chatId, telegramId, env);
+    await showAdminHomeworkList(
+      chatId,
+      telegramId,
+      env
+    );
+
     return;
   }
 
   if (data.startsWith("hw_edit_")) {
-    const id = Number(data.replace("hw_edit_", ""));
-    await beginHomeworkEdit(chatId, telegramId, id, env);
+    const id =
+      Number(
+        data.replace(
+          "hw_edit_",
+          ""
+        )
+      );
+
+    await beginHomeworkEdit(
+      chatId,
+      telegramId,
+      id,
+      env
+    );
+
     return;
   }
 
   if (data.startsWith("hw_delete_")) {
-    const id = Number(data.replace("hw_delete_", ""));
-    await deleteHomework(chatId, telegramId, id, env);
+    const id =
+      Number(
+        data.replace(
+          "hw_delete_",
+          ""
+        )
+      );
+
+    await deleteHomework(
+      chatId,
+      telegramId,
+      id,
+      env
+    );
+
     return;
   }
 
   if (data.startsWith("hw_archive_")) {
-    const id = Number(data.replace("hw_archive_", ""));
-    await archiveHomework(chatId, telegramId, id, env);
+    const id =
+      Number(
+        data.replace(
+          "hw_archive_",
+          ""
+        )
+      );
+
+    await archiveHomework(
+      chatId,
+      telegramId,
+      id,
+      env
+    );
+
     return;
   }
 
   if (data.startsWith("hw_copy_")) {
-    const id = Number(data.replace("hw_copy_", ""));
-    await beginHomeworkCopy(chatId, telegramId, id, env);
+    const id =
+      Number(
+        data.replace(
+          "hw_copy_",
+          ""
+        )
+      );
+
+    await beginHomeworkCopy(
+      chatId,
+      telegramId,
+      id,
+      env
+    );
+
     return;
   }
 
@@ -482,54 +998,155 @@ async function handleCallback(query, env) {
   =================================================== */
 
   if (data === "sch_admin_menu") {
-    await showAdminSchedule(chatId, telegramId, env);
+    await showAdminSchedule(
+      chatId,
+      telegramId,
+      env
+    );
+
     return;
   }
 
   if (data.startsWith("sch_day_")) {
-    const day = Number(data.replace("sch_day_", ""));
-    await showAdminScheduleDay(chatId, telegramId, day, env);
+    const day =
+      Number(
+        data.replace(
+          "sch_day_",
+          ""
+        )
+      );
+
+    await showAdminScheduleDay(
+      chatId,
+      telegramId,
+      day,
+      env
+    );
+
     return;
   }
 
   if (data === "sch_admin_add") {
-    await beginScheduleAdd(chatId, telegramId, env);
+    await beginScheduleAdd(
+      chatId,
+      telegramId,
+      env
+    );
+
     return;
   }
 
   if (data.startsWith("sch_edit_")) {
-    const id = Number(data.replace("sch_edit_", ""));
-    await beginScheduleEdit(chatId, telegramId, id, env);
+    const id =
+      Number(
+        data.replace(
+          "sch_edit_",
+          ""
+        )
+      );
+
+    await beginScheduleEdit(
+      chatId,
+      telegramId,
+      id,
+      env
+    );
+
     return;
   }
 
   if (data.startsWith("sch_delete_")) {
-    const id = Number(data.replace("sch_delete_", ""));
-    await deleteScheduleLesson(chatId, telegramId, id, env);
+    const id =
+      Number(
+        data.replace(
+          "sch_delete_",
+          ""
+        )
+      );
+
+    await deleteScheduleLesson(
+      chatId,
+      telegramId,
+      id,
+      env
+    );
+
     return;
   }
 
   if (data.startsWith("sch_exception_")) {
-    const day = Number(data.replace("sch_exception_", ""));
-    await beginScheduleException(chatId, telegramId, day, env);
+    const day =
+      Number(
+        data.replace(
+          "sch_exception_",
+          ""
+        )
+      );
+
+    await beginScheduleException(
+      chatId,
+      telegramId,
+      day,
+      env
+    );
+
     return;
   }
 
   if (data.startsWith("sch_exceptions_")) {
-    const day = Number(data.replace("sch_exceptions_", ""));
-    await showScheduleExceptions(chatId, telegramId, day, env);
+    const day =
+      Number(
+        data.replace(
+          "sch_exceptions_",
+          ""
+        )
+      );
+
+    await showScheduleExceptions(
+      chatId,
+      telegramId,
+      day,
+      env
+    );
+
     return;
   }
 
   if (data.startsWith("sch_ex_delete_")) {
-    const id = Number(data.replace("sch_ex_delete_", ""));
-    await deleteScheduleException(chatId, telegramId, id, env);
+    const id =
+      Number(
+        data.replace(
+          "sch_ex_delete_",
+          ""
+        )
+      );
+
+    await deleteScheduleException(
+      chatId,
+      telegramId,
+      id,
+      env
+    );
+
     return;
   }
 
   if (data.startsWith("sch_copy_")) {
-    const day = Number(data.replace("sch_copy_", ""));
-    await beginScheduleCopy(chatId, telegramId, day, env);
+    const day =
+      Number(
+        data.replace(
+          "sch_copy_",
+          ""
+        )
+      );
+
+    await beginScheduleCopy(
+      chatId,
+      telegramId,
+      day,
+      env
+    );
+
     return;
   }
 }
@@ -539,11 +1156,21 @@ async function handleCallback(query, env) {
    TODAY
 ===================================================== */
 
-async function showToday(chatId, telegramId, env) {
-  const dateString = getLocalDate();
-  const day = getDayOfWeek(dateString);
+async function showToday(
+  chatId,
+  telegramId,
+  env
+) {
+  const dateString =
+    getLocalDate();
 
-  if (day === 0 || day === 6) {
+  const day =
+    getDayOfWeek(dateString);
+
+  if (
+    day === 0 ||
+    day === 6
+  ) {
     await telegram("sendMessage", {
       chat_id: chatId,
       text:
@@ -583,7 +1210,10 @@ async function showToday(chatId, telegramId, env) {
    SCHEDULE MENU
 ===================================================== */
 
-async function showSchedule(chatId, env) {
+async function showSchedule(
+  chatId,
+  env
+) {
   await telegram("sendMessage", {
     chat_id: chatId,
     text:
@@ -592,22 +1222,46 @@ async function showSchedule(chatId, env) {
     reply_markup: {
       inline_keyboard: [
         [
-          { text: "Понедельник", callback_data: "day_1" },
-          { text: "Вторник", callback_data: "day_2" }
+          {
+            text: "Понедельник",
+            callback_data: "day_1"
+          },
+          {
+            text: "Вторник",
+            callback_data: "day_2"
+          }
         ],
         [
-          { text: "Среда", callback_data: "day_3" },
-          { text: "Четверг", callback_data: "day_4" }
+          {
+            text: "Среда",
+            callback_data: "day_3"
+          },
+          {
+            text: "Четверг",
+            callback_data: "day_4"
+          }
         ],
         [
-          { text: "Пятница", callback_data: "day_5" }
+          {
+            text: "Пятница",
+            callback_data: "day_5"
+          }
         ],
         [
-          { text: "☀️ Сегодня", callback_data: "today_schedule" },
-          { text: "⚡ Что сейчас?", callback_data: "current_lesson" }
+          {
+            text: "☀️ Сегодня",
+            callback_data: "today_schedule"
+          },
+          {
+            text: "⚡ Что сейчас?",
+            callback_data: "current_lesson"
+          }
         ],
         [
-          { text: "◀️ Назад", callback_data: "back" }
+          {
+            text: "◀️ Назад",
+            callback_data: "back"
+          }
         ]
       ]
     }
@@ -636,18 +1290,20 @@ async function showScheduleDay(
   if (!dayNames[day]) {
     await telegram("sendMessage", {
       chat_id: chatId,
-      text: "❗ Расписание для этого дня недоступно.",
+      text:
+        "❗ Расписание для этого дня недоступно.",
       reply_markup: backMenu()
     }, env);
 
     return;
   }
 
-  const result = await getScheduleForDate(
-    specificDate,
-    day,
-    env
-  );
+  const result =
+    await getScheduleForDate(
+      specificDate,
+      day,
+      env
+    );
 
   if (!result.length) {
     await telegram("sendMessage", {
@@ -665,14 +1321,16 @@ async function showScheduleDay(
     `📅 ${dayNames[day]}\n`;
 
   if (specificDate) {
-    text += `📆 ${formatDate(specificDate)}\n`;
+    text +=
+      `📆 ${formatDate(specificDate)}\n`;
   }
 
   text += `\n`;
 
   for (const lesson of result) {
     text +=
-      `${lesson.lesson_number}. ${lesson.start_time}–${lesson.end_time}\n` +
+      `${lesson.lesson_number}. ` +
+      `${lesson.start_time}–${lesson.end_time}\n` +
       `📚 ${lesson.subject}\n` +
       `👨‍🏫 ${lesson.teacher || "Не указан"}\n` +
       `🚪 ${lesson.room || "Не указан"}\n\n`;
@@ -710,58 +1368,81 @@ async function getScheduleForDate(
   day,
   env
 ) {
-  const baseResult = await env.DB.prepare(
-    `SELECT
-       id,
-       lesson_number,
-       start_time,
-       end_time,
-       subject,
-       teacher,
-       room
-     FROM schedule
-     WHERE day_of_week = ?
-       AND academic_year = ?
-     ORDER BY lesson_number`
-  )
-    .bind(day, ACADEMIC_YEAR)
-    .all();
+  const baseResult =
+    await env.DB.prepare(
+      `SELECT
+         id,
+         lesson_number,
+         start_time,
+         end_time,
+         subject,
+         teacher,
+         room
+       FROM schedule
+       WHERE day_of_week = ?
+         AND academic_year = ?
+       ORDER BY lesson_number`
+    )
+      .bind(
+        day,
+        ACADEMIC_YEAR
+      )
+      .all();
 
-  const lessons = (baseResult.results || []).map(
-    lesson => ({ ...lesson })
-  );
+  const lessons =
+    (baseResult.results || [])
+      .map(
+        lesson => ({
+          ...lesson
+        })
+      );
 
   if (!specificDate) {
     return lessons;
   }
 
-  const exceptionResult = await env.DB.prepare(
-    `SELECT
-       id,
-       lesson_number,
-       start_time,
-       end_time,
-       subject,
-       teacher,
-       room,
-       action
-     FROM schedule_exceptions
-     WHERE lesson_date = ?
-     ORDER BY lesson_number`
-  )
-    .bind(specificDate)
-    .all();
+  const exceptionResult =
+    await env.DB.prepare(
+      `SELECT
+         id,
+         lesson_number,
+         start_time,
+         end_time,
+         subject,
+         teacher,
+         room,
+         action
+       FROM schedule_exceptions
+       WHERE lesson_date = ?
+       ORDER BY lesson_number`
+    )
+      .bind(specificDate)
+      .all();
 
-  for (const exception of exceptionResult.results || []) {
-    const index = lessons.findIndex(
-      lesson =>
-        Number(lesson.lesson_number) ===
-        Number(exception.lesson_number)
-    );
+  for (
+    const exception
+    of exceptionResult.results || []
+  ) {
+    const index =
+      lessons.findIndex(
+        lesson =>
+          Number(
+            lesson.lesson_number
+          ) ===
+          Number(
+            exception.lesson_number
+          )
+      );
 
-    if (exception.action === "delete") {
+    if (
+      exception.action ===
+      "delete"
+    ) {
       if (index >= 0) {
-        lessons.splice(index, 1);
+        lessons.splice(
+          index,
+          1
+        );
       }
 
       continue;
@@ -773,7 +1454,9 @@ async function getScheduleForDate(
         : {};
 
     const changed = {
-      id: base.id || null,
+      id:
+        base.id ||
+        null,
 
       lesson_number:
         exception.lesson_number,
@@ -805,16 +1488,23 @@ async function getScheduleForDate(
     };
 
     if (index >= 0) {
-      lessons[index] = changed;
+      lessons[index] =
+        changed;
     } else {
-      lessons.push(changed);
+      lessons.push(
+        changed
+      );
     }
   }
 
   lessons.sort(
     (a, b) =>
-      Number(a.lesson_number) -
-      Number(b.lesson_number)
+      Number(
+        a.lesson_number
+      ) -
+      Number(
+        b.lesson_number
+      )
   );
 
   return lessons;
@@ -825,11 +1515,20 @@ async function getScheduleForDate(
    CURRENT LESSON
 ===================================================== */
 
-async function showCurrentLesson(chatId, env) {
-  const date = getLocalDate();
-  const day = getDayOfWeek(date);
+async function showCurrentLesson(
+  chatId,
+  env
+) {
+  const date =
+    getLocalDate();
 
-  if (day === 0 || day === 6) {
+  const day =
+    getDayOfWeek(date);
+
+  if (
+    day === 0 ||
+    day === 6
+  ) {
     await telegram("sendMessage", {
       chat_id: chatId,
       text:
@@ -841,10 +1540,12 @@ async function showCurrentLesson(chatId, env) {
     return;
   }
 
-  const time = getLocalTime();
+  const time =
+    getLocalTime();
 
   const currentMinutes =
-    time.hour * 60 + time.minute;
+    time.hour * 60 +
+    time.minute;
 
   const lessons =
     await getScheduleForDate(
@@ -858,10 +1559,14 @@ async function showCurrentLesson(chatId, env) {
 
   for (const lesson of lessons) {
     const start =
-      timeToMinutes(lesson.start_time);
+      timeToMinutes(
+        lesson.start_time
+      );
 
     const end =
-      timeToMinutes(lesson.end_time);
+      timeToMinutes(
+        lesson.end_time
+      );
 
     if (
       currentMinutes >= start &&
@@ -879,11 +1584,13 @@ async function showCurrentLesson(chatId, env) {
     }
   }
 
-  let text = `⚡ Что сейчас?\n\n`;
+  let text =
+    `⚡ Что сейчас?\n\n`;
 
   if (current) {
     text +=
-      `🔴 Сейчас идёт ${current.lesson_number}-я пара\n\n` +
+      `🔴 Сейчас идёт ` +
+      `${current.lesson_number}-я пара\n\n` +
       `📚 ${current.subject}\n` +
       `👨‍🏫 ${current.teacher || "Не указан"}\n` +
       `🚪 ${current.room || "Не указан"}\n` +
@@ -891,7 +1598,8 @@ async function showCurrentLesson(chatId, env) {
   } else if (next) {
     text +=
       `🟢 Сейчас перемена.\n\n` +
-      `Следующая — ${next.lesson_number}-я пара\n` +
+      `Следующая — ` +
+      `${next.lesson_number}-я пара\n` +
       `⏰ ${next.start_time}–${next.end_time}\n` +
       `📚 ${next.subject}\n` +
       `🚪 ${next.room || "Не указан"}`;
@@ -912,7 +1620,10 @@ async function showCurrentLesson(chatId, env) {
    HOMEWORK MENU
 ===================================================== */
 
-async function showHomeworkMenu(chatId, env) {
+async function showHomeworkMenu(
+  chatId,
+  env
+) {
   await telegram("sendMessage", {
     chat_id: chatId,
     text:
@@ -970,15 +1681,27 @@ async function showHomework(
     "📚 ДЗ на сегодня";
 
   if (type === "tomorrow") {
-    from = addDays(today, 1);
+    from =
+      addDays(
+        today,
+        1
+      );
+
     to = from;
+
     title =
       "📚 ДЗ на завтра";
   }
 
   if (type === "week") {
     from = today;
-    to = addDays(today, 6);
+
+    to =
+      addDays(
+        today,
+        6
+      );
+
     title =
       "📚 ДЗ на неделю";
   }
@@ -986,6 +1709,7 @@ async function showHomework(
   if (type === "all") {
     from = "0000-01-01";
     to = "9999-12-31";
+
     title =
       "📚 Все ДЗ";
   }
@@ -1008,7 +1732,10 @@ async function showHomework(
          id ASC
        LIMIT 100`
     )
-      .bind(from, to)
+      .bind(
+        from,
+        to
+      )
       .all();
 
   const rows =
@@ -1031,7 +1758,10 @@ async function showHomework(
 
   let currentDate = "";
 
-  for (const homework of rows) {
+  for (
+    const homework
+    of rows
+  ) {
     if (
       homework.lesson_date !==
       currentDate
@@ -1046,7 +1776,9 @@ async function showHomework(
     text +=
       `📚 ${homework.subject}\n`;
 
-    if (homework.lesson_number) {
+    if (
+      homework.lesson_number
+    ) {
       text +=
         `🔢 Пара №${homework.lesson_number}\n`;
     }
@@ -1080,7 +1812,7 @@ async function isAdmin(
       .bind(telegramId)
       .first();
 
-  return (
+  return !!(
     student &&
     (
       student.role === "admin" ||
@@ -1099,7 +1831,12 @@ async function showAdmin(
   telegramId,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) {
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
     await telegram("sendMessage", {
       chat_id: chatId,
       text:
@@ -1141,21 +1878,25 @@ async function showAdmin(
             callback_data: "admin_announcements"
           },
           {
-            text: "🕐 Посещаемость",
-            callback_data: "admin_attendance"
+            text: "📢 Оповещения",
+            callback_data: "admin_alerts"
           }
         ],
         [
+          {
+            text: "🕐 Посещаемость",
+            callback_data: "admin_attendance"
+          },
           {
             text: "🔄 Замены",
             callback_data: "admin_replacements"
-          },
-          {
-            text: "📊 Статистика",
-            callback_data: "admin_stats"
           }
         ],
         [
+          {
+            text: "📊 Статистика",
+            callback_data: "admin_stats"
+          },
           {
             text: "👥 Участники",
             callback_data: "admin_students"
@@ -1190,6 +1931,578 @@ async function showAdmin(
 
 
 /* =====================================================
+   ADMIN ALERTS
+===================================================== */
+
+async function showAdminAlerts(
+  chatId,
+  telegramId,
+  env
+) {
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
+
+  await telegram("sendMessage", {
+    chat_id: chatId,
+    text:
+      `📢 Оповещения\n\n` +
+      `Выбери действие:`,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "🚨 Тревога",
+            callback_data: "alert_air"
+          }
+        ],
+        [
+          {
+            text: "🟢 Отмена тревоги",
+            callback_data: "alert_end_air"
+          }
+        ],
+        [
+          {
+            text: "◀️ В админ-панель",
+            callback_data: "admin"
+          }
+        ]
+      ]
+    }
+  }, env);
+}
+
+
+async function sendManualAlert(
+  chatId,
+  telegramId,
+  type,
+  env
+) {
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
+
+  const setting =
+    await env.DB.prepare(
+      `SELECT value
+       FROM settings
+       WHERE key = 'group_chat_id'`
+    )
+      .first();
+
+  if (
+    !setting ||
+    !setting.value
+  ) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text:
+        `❌ ID группы пока не сохранён.\n\n` +
+        `Сначала отправь сообщение в тестовой группе.`
+    }, env);
+
+    return;
+  }
+
+  let text;
+
+  if (type === "air") {
+    text =
+      `🚨 ВНИМАНИЕ!\n\n` +
+      `Включено оповещение.\n` +
+      `Следуйте указаниям администрации.`;
+  } else {
+    text =
+      `🟢 ОТБОЙ ОПОВЕЩЕНИЯ\n\n` +
+      `Оповещение завершено.`;
+  }
+
+  const result =
+    await telegram(
+      "sendMessage",
+      {
+        chat_id: setting.value,
+        text
+      },
+      env
+    );
+
+  if (result.ok) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text:
+        `✅ Оповещение отправлено в группу.`,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "📢 Оповещения",
+              callback_data: "admin_alerts"
+            }
+          ],
+          [
+            {
+              text: "◀️ Админ-панель",
+              callback_data: "admin"
+            }
+          ]
+        ]
+      }
+    }, env);
+  } else {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text:
+        `❌ Не удалось отправить сообщение в группу.\n\n` +
+        `${result.description || "Ошибка Telegram"}`
+    }, env);
+  }
+}
+
+
+/* =====================================================
+   ADMIN STUDENTS
+===================================================== */
+
+async function showAdminStudents(
+  chatId,
+  telegramId,
+  env
+) {
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text: "⛔ Нет доступа."
+    }, env);
+
+    return;
+  }
+
+  const result =
+    await env.DB.prepare(
+      `SELECT
+         id,
+         full_name,
+         username,
+         role,
+         telegram_id,
+         phone,
+         is_active
+       FROM students
+       WHERE is_active = 1
+       ORDER BY full_name`
+    ).all();
+
+  const rows =
+    result.results || [];
+
+  let text =
+    `👥 Участники ПК-38\n\n` +
+    `Количество: ${rows.length}\n\n` +
+    `Выбери участника:`;
+
+  const buttons = [];
+
+  for (const student of rows) {
+    buttons.push([
+      {
+        text:
+          `${student.telegram_id ? "🟢" : "⚪"} ` +
+          `${student.full_name}`,
+        callback_data:
+          `admin_student_${student.id}`
+      }
+    ]);
+  }
+
+  buttons.push([
+    {
+      text: "◀️ В админ-панель",
+      callback_data: "admin"
+    }
+  ]);
+
+  await telegram("sendMessage", {
+    chat_id: chatId,
+    text,
+    reply_markup: {
+      inline_keyboard: buttons
+    }
+  }, env);
+}
+
+
+async function showAdminStudent(
+  chatId,
+  telegramId,
+  studentId,
+  env
+) {
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
+
+  const student =
+    await env.DB.prepare(
+      `SELECT
+         id,
+         full_name,
+         phone,
+         telegram_id,
+         username,
+         role,
+         is_active
+       FROM students
+       WHERE id = ?`
+    )
+      .bind(studentId)
+      .first();
+
+  if (!student) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text:
+        `❌ Участник не найден.`,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "◀️ К участникам",
+              callback_data: "admin_students"
+            }
+          ]
+        ]
+      }
+    }, env);
+
+    return;
+  }
+
+  const status =
+    student.is_active
+      ? "🟢 Активен"
+      : "⚪ Неактивен";
+
+  const telegramStatus =
+    student.telegram_id
+      ? "🟢 Привязан"
+      : "⚪ Не привязан";
+
+  let text =
+    `👤 Участник ПК-38\n\n` +
+    `ФИО:\n${student.full_name}\n\n` +
+    `📱 Телефон:\n${student.phone || "Не указан"}\n\n` +
+    `🆔 Telegram ID:\n${student.telegram_id || "Не привязан"}\n\n` +
+    `🔗 Username:\n${student.username ? "@" + student.username : "Нет"}\n\n` +
+    `👑 Роль:\n${student.role}\n\n` +
+    `📌 Статус:\n${status}\n` +
+    `${telegramStatus}`;
+
+  const buttons = [];
+
+  if (student.telegram_id) {
+    buttons.push([
+      {
+        text: "🔓 Отвязать Telegram",
+        callback_data:
+          `student_unlink_${student.id}`
+      }
+    ]);
+  } else {
+    buttons.push([
+      {
+        text: "🔗 Привязать Telegram",
+        callback_data:
+          `student_link_${student.id}`
+      }
+    ]);
+  }
+
+  buttons.push([
+    {
+      text: "◀️ К участникам",
+      callback_data: "admin_students"
+    }
+  ]);
+
+  await telegram("sendMessage", {
+    chat_id: chatId,
+    text,
+    reply_markup: {
+      inline_keyboard: buttons
+    }
+  }, env);
+}
+
+
+/* =====================================================
+   CREATE LINK CODE
+===================================================== */
+
+async function createTelegramLinkCode(
+  chatId,
+  telegramId,
+  studentId,
+  env
+) {
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
+
+  const student =
+    await env.DB.prepare(
+      `SELECT
+         id,
+         full_name,
+         telegram_id
+       FROM students
+       WHERE id = ?`
+    )
+      .bind(studentId)
+      .first();
+
+  if (!student) {
+    return;
+  }
+
+  if (student.telegram_id) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text:
+        `⚠️ У этого участника уже привязан Telegram.`,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "◀️ Назад",
+              callback_data:
+                `admin_student_${studentId}`
+            }
+          ]
+        ]
+      }
+    }, env);
+
+    return;
+  }
+
+  /* Удаляем старые коды этого ученика */
+  await env.DB.prepare(
+    `DELETE FROM link_codes
+     WHERE student_id = ?`
+  )
+    .bind(studentId)
+    .run();
+
+  let code = null;
+
+  for (let attempt = 0; attempt < 20; attempt++) {
+    const candidate =
+      generateSixDigitCode();
+
+    const exists =
+      await env.DB.prepare(
+        `SELECT code
+         FROM link_codes
+         WHERE code = ?`
+      )
+        .bind(candidate)
+        .first();
+
+    if (!exists) {
+      code = candidate;
+      break;
+    }
+  }
+
+  if (!code) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text:
+        `❌ Не удалось создать код.\n\n` +
+        `Попробуй ещё раз.`
+    }, env);
+
+    return;
+  }
+
+  const expiresAt =
+    new Date(
+      Date.now() +
+      LINK_CODE_TTL_MINUTES *
+      60 *
+      1000
+    ).toISOString();
+
+  await env.DB.prepare(
+    `INSERT INTO link_codes
+     (
+       code,
+       student_id,
+       expires_at,
+       created_by
+     )
+     VALUES (?, ?, ?, ?)`
+  )
+    .bind(
+      code,
+      studentId,
+      expiresAt,
+      telegramId
+    )
+    .run();
+
+  await telegram("sendMessage", {
+    chat_id: chatId,
+    text:
+      `🔗 Код привязки создан!\n\n` +
+      `👤 ${student.full_name}\n\n` +
+      `🔢 Код:\n` +
+      `\`${code}\`\n\n` +
+      `⏰ Действует ${LINK_CODE_TTL_MINUTES} минут.\n\n` +
+      `Передай этот код именно этому ученику.\n\n` +
+      `Ученик должен открыть личный чат с ботом и отправить код.`,
+    parse_mode: "Markdown",
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "🔄 Создать новый код",
+            callback_data:
+              `student_link_${studentId}`
+          }
+        ],
+        [
+          {
+            text: "◀️ К участнику",
+            callback_data:
+              `admin_student_${studentId}`
+          }
+        ]
+      ]
+    }
+  }, env);
+}
+
+
+function generateSixDigitCode() {
+  const array =
+    new Uint32Array(1);
+
+  crypto.getRandomValues(array);
+
+  return String(
+    100000 +
+    (array[0] % 900000)
+  );
+}
+
+
+/* =====================================================
+   UNLINK TELEGRAM
+===================================================== */
+
+async function unlinkTelegram(
+  chatId,
+  telegramId,
+  studentId,
+  env
+) {
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
+
+  const student =
+    await env.DB.prepare(
+      `SELECT
+         id,
+         full_name
+       FROM students
+       WHERE id = ?`
+    )
+      .bind(studentId)
+      .first();
+
+  if (!student) {
+    return;
+  }
+
+  await env.DB.prepare(
+    `UPDATE students
+     SET
+       telegram_id = NULL,
+       username = NULL
+     WHERE id = ?`
+  )
+    .bind(studentId)
+    .run();
+
+  await env.DB.prepare(
+    `DELETE FROM link_codes
+     WHERE student_id = ?`
+  )
+    .bind(studentId)
+    .run();
+
+  await telegram("sendMessage", {
+    chat_id: chatId,
+    text:
+      `🔓 Telegram отвязан.\n\n` +
+      `👤 ${student.full_name}`,
+    reply_markup: {
+      inline_keyboard: [
+        [
+          {
+            text: "🔗 Привязать заново",
+            callback_data:
+              `student_link_${studentId}`
+          }
+        ],
+        [
+          {
+            text: "◀️ К участникам",
+            callback_data: "admin_students"
+          }
+        ]
+      ]
+    }
+  }, env);
+}
+
+
+/* =====================================================
    ADMIN HOMEWORK MENU
 ===================================================== */
 
@@ -1198,7 +2511,12 @@ async function showAdminHomework(
   telegramId,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) {
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
     await telegram("sendMessage", {
       chat_id: chatId,
       text: "⛔ Нет доступа."
@@ -1247,7 +2565,12 @@ async function showAdminHomeworkList(
   telegramId,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) {
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
     return;
   }
 
@@ -1315,23 +2638,30 @@ async function showAdminHomeworkList(
 
     buttons.push([
       {
-        text: `✏️ Изменить №${hw.id}`,
-        callback_data: `hw_edit_${hw.id}`
+        text:
+          `✏️ Изменить №${hw.id}`,
+        callback_data:
+          `hw_edit_${hw.id}`
       },
       {
         text: `📋 Копия`,
-        callback_data: `hw_copy_${hw.id}`
+        callback_data:
+          `hw_copy_${hw.id}`
       }
     ]);
 
     buttons.push([
       {
-        text: `📦 Архив №${hw.id}`,
-        callback_data: `hw_archive_${hw.id}`
+        text:
+          `📦 Архив №${hw.id}`,
+        callback_data:
+          `hw_archive_${hw.id}`
       },
       {
-        text: `🗑 Удалить`,
-        callback_data: `hw_delete_${hw.id}`
+        text:
+          `🗑 Удалить`,
+        callback_data:
+          `hw_delete_${hw.id}`
       }
     ]);
   }
@@ -1364,15 +2694,27 @@ async function processHomeworkAdd(
   state,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) {
-    await clearPendingInput(telegramId, env);
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    await clearPendingInput(
+      telegramId,
+      env
+    );
+
     return true;
   }
 
   const chatId =
     message.chat.id;
 
-  if (state.action === "hw_add_date") {
+  if (
+    state.action ===
+    "hw_add_date"
+  ) {
     const date =
       parseRussianDate(text);
 
@@ -1382,8 +2724,7 @@ async function processHomeworkAdd(
         text:
           `❗ Неверная дата.\n\n` +
           `Используй формат:\n` +
-          `ДД.ММ.ГГГГ\n\n` +
-          `Например: 09.09.2026`
+          `ДД.ММ.ГГГГ`
       }, env);
 
       return true;
@@ -1409,11 +2750,15 @@ async function processHomeworkAdd(
     return true;
   }
 
-  if (state.action === "hw_add_subject") {
+  if (
+    state.action ===
+    "hw_add_subject"
+  ) {
     if (!text) {
       await telegram("sendMessage", {
         chat_id: chatId,
-        text: "❗ Предмет не может быть пустым."
+        text:
+          "❗ Предмет не может быть пустым."
       }, env);
 
       return true;
@@ -1423,8 +2768,10 @@ async function processHomeworkAdd(
       telegramId,
       "hw_add_text",
       {
-        date: state.data.date,
-        subject: text
+        date:
+          state.data.date,
+        subject:
+          text
       },
       env
     );
@@ -1439,14 +2786,20 @@ async function processHomeworkAdd(
     return true;
   }
 
-  if (state.action === "hw_add_text") {
+  if (
+    state.action ===
+    "hw_add_text"
+  ) {
     await beginPendingInput(
       telegramId,
       "hw_add_lesson",
       {
-        date: state.data.date,
-        subject: state.data.subject,
-        homeworkText: text
+        date:
+          state.data.date,
+        subject:
+          state.data.subject,
+        homeworkText:
+          text
       },
       env
     );
@@ -1462,7 +2815,10 @@ async function processHomeworkAdd(
     return true;
   }
 
-  if (state.action === "hw_add_lesson") {
+  if (
+    state.action ===
+    "hw_add_lesson"
+  ) {
     const lesson =
       Number(text);
 
@@ -1495,7 +2851,9 @@ async function processHomeworkAdd(
         state.data.date,
         state.data.subject,
         state.data.homeworkText,
-        lesson === 0 ? null : lesson,
+        lesson === 0
+          ? null
+          : lesson,
         telegramId
       )
       .run();
@@ -1512,19 +2870,25 @@ async function processHomeworkAdd(
         `📅 ${formatDate(state.data.date)}\n` +
         `📚 ${state.data.subject}\n` +
         `📝 ${state.data.homeworkText}\n` +
-        `🔢 ${lesson === 0 ? "Пара не указана" : `Пара №${lesson}`}`,
+        `🔢 ${
+          lesson === 0
+            ? "Пара не указана"
+            : `Пара №${lesson}`
+        }`,
       reply_markup: {
         inline_keyboard: [
           [
             {
               text: "📚 Список ДЗ",
-              callback_data: "hw_admin_list"
+              callback_data:
+                "hw_admin_list"
             }
           ],
           [
             {
               text: "◀️ В админ-панель",
-              callback_data: "admin"
+              callback_data:
+                "admin"
             }
           ]
         ]
@@ -1548,7 +2912,12 @@ async function beginHomeworkEdit(
   id,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) {
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
     return;
   }
 
@@ -1564,7 +2933,8 @@ async function beginHomeworkEdit(
   if (!hw) {
     await telegram("sendMessage", {
       chat_id: chatId,
-      text: "❗ ДЗ не найдено."
+      text:
+        "❗ ДЗ не найдено."
     }, env);
 
     return;
@@ -1575,9 +2945,12 @@ async function beginHomeworkEdit(
     "hw_edit_date",
     {
       id,
-      subject: hw.subject,
-      text: hw.text,
-      lesson: hw.lesson_number
+      subject:
+        hw.subject,
+      text:
+        hw.text,
+      lesson:
+        hw.lesson_number
     },
     env
   );
@@ -1600,22 +2973,35 @@ async function processHomeworkEdit(
   state,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) {
-    await clearPendingInput(telegramId, env);
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    await clearPendingInput(
+      telegramId,
+      env
+    );
+
     return true;
   }
 
   const chatId =
     message.chat.id;
 
-  if (state.action === "hw_edit_date") {
+  if (
+    state.action ===
+    "hw_edit_date"
+  ) {
     const date =
       parseRussianDate(text);
 
     if (!date) {
       await telegram("sendMessage", {
         chat_id: chatId,
-        text: "❗ Используй формат ДД.ММ.ГГГГ."
+        text:
+          "❗ Используй формат ДД.ММ.ГГГГ."
       }, env);
 
       return true;
@@ -1641,8 +3027,13 @@ async function processHomeworkEdit(
     return true;
   }
 
-  if (state.action === "hw_edit_subject") {
-    if (!text) return true;
+  if (
+    state.action ===
+    "hw_edit_subject"
+  ) {
+    if (!text) {
+      return true;
+    }
 
     await beginPendingInput(
       telegramId,
@@ -1664,7 +3055,10 @@ async function processHomeworkEdit(
     return true;
   }
 
-  if (state.action === "hw_edit_text") {
+  if (
+    state.action ===
+    "hw_edit_text"
+  ) {
     await beginPendingInput(
       telegramId,
       "hw_edit_lesson",
@@ -1686,7 +3080,10 @@ async function processHomeworkEdit(
     return true;
   }
 
-  if (state.action === "hw_edit_lesson") {
+  if (
+    state.action ===
+    "hw_edit_lesson"
+  ) {
     const lesson =
       Number(text);
 
@@ -1697,7 +3094,8 @@ async function processHomeworkEdit(
     ) {
       await telegram("sendMessage", {
         chat_id: chatId,
-        text: "❗ Введи число от 0 до 4."
+        text:
+          "❗ Введи число от 0 до 4."
       }, env);
 
       return true;
@@ -1717,7 +3115,9 @@ async function processHomeworkEdit(
         state.data.date,
         state.data.subject,
         state.data.text,
-        lesson === 0 ? null : lesson,
+        lesson === 0
+          ? null
+          : lesson,
         state.data.id
       )
       .run();
@@ -1736,13 +3136,15 @@ async function processHomeworkEdit(
           [
             {
               text: "📋 Список ДЗ",
-              callback_data: "hw_admin_list"
+              callback_data:
+                "hw_admin_list"
             }
           ],
           [
             {
               text: "◀️ Админ-панель",
-              callback_data: "admin"
+              callback_data:
+                "admin"
             }
           ]
         ]
@@ -1766,7 +3168,14 @@ async function deleteHomework(
   id,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) return;
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
 
   await env.DB.prepare(
     `DELETE FROM homework
@@ -1784,13 +3193,15 @@ async function deleteHomework(
         [
           {
             text: "📋 Список ДЗ",
-            callback_data: "hw_admin_list"
+            callback_data:
+              "hw_admin_list"
           }
         ],
         [
           {
             text: "◀️ Назад",
-            callback_data: "admin_homework"
+            callback_data:
+              "admin_homework"
           }
         ]
       ]
@@ -1805,7 +3216,14 @@ async function archiveHomework(
   id,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) return;
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
 
   await env.DB.prepare(
     `UPDATE homework
@@ -1826,13 +3244,15 @@ async function archiveHomework(
         [
           {
             text: "📋 Список ДЗ",
-            callback_data: "hw_admin_list"
+            callback_data:
+              "hw_admin_list"
           }
         ],
         [
           {
             text: "◀️ Назад",
-            callback_data: "admin_homework"
+            callback_data:
+              "admin_homework"
           }
         ]
       ]
@@ -1847,7 +3267,14 @@ async function beginHomeworkCopy(
   id,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) return;
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
 
   const hw =
     await env.DB.prepare(
@@ -1886,8 +3313,17 @@ async function processHomeworkCopy(
   state,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) {
-    await clearPendingInput(telegramId, env);
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    await clearPendingInput(
+      telegramId,
+      env
+    );
+
     return true;
   }
 
@@ -1897,7 +3333,8 @@ async function processHomeworkCopy(
   if (!date) {
     await telegram("sendMessage", {
       chat_id: message.chat.id,
-      text: "❗ Используй формат ДД.ММ.ГГГГ."
+      text:
+        "❗ Используй формат ДД.ММ.ГГГГ."
     }, env);
 
     return true;
@@ -1957,7 +3394,8 @@ async function processHomeworkCopy(
         [
           {
             text: "📋 Список ДЗ",
-            callback_data: "hw_admin_list"
+            callback_data:
+              "hw_admin_list"
           }
         ]
       ]
@@ -1977,7 +3415,12 @@ async function showAdminSchedule(
   telegramId,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) {
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
     await telegram("sendMessage", {
       chat_id: chatId,
       text: "⛔ Нет доступа."
@@ -1996,39 +3439,46 @@ async function showAdminSchedule(
         [
           {
             text: "Понедельник",
-            callback_data: "sch_day_1"
+            callback_data:
+              "sch_day_1"
           },
           {
             text: "Вторник",
-            callback_data: "sch_day_2"
+            callback_data:
+              "sch_day_2"
           }
         ],
         [
           {
             text: "Среда",
-            callback_data: "sch_day_3"
+            callback_data:
+              "sch_day_3"
           },
           {
             text: "Четверг",
-            callback_data: "sch_day_4"
+            callback_data:
+              "sch_day_4"
           }
         ],
         [
           {
             text: "Пятница",
-            callback_data: "sch_day_5"
+            callback_data:
+              "sch_day_5"
           }
         ],
         [
           {
             text: "➕ Добавить пару",
-            callback_data: "sch_admin_add"
+            callback_data:
+              "sch_admin_add"
           }
         ],
         [
           {
             text: "◀️ В админ-панель",
-            callback_data: "admin"
+            callback_data:
+              "admin"
           }
         ]
       ]
@@ -2047,7 +3497,14 @@ async function showAdminScheduleDay(
   day,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) return;
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
 
   const dayNames = {
     1: "Понедельник",
@@ -2057,7 +3514,9 @@ async function showAdminScheduleDay(
     5: "Пятница"
   };
 
-  if (!dayNames[day]) return;
+  if (!dayNames[day]) {
+    return;
+  }
 
   const result =
     await env.DB.prepare(
@@ -2074,7 +3533,10 @@ async function showAdminScheduleDay(
          AND academic_year = ?
        ORDER BY lesson_number`
     )
-      .bind(day, ACADEMIC_YEAR)
+      .bind(
+        day,
+        ACADEMIC_YEAR
+      )
       .all();
 
   const rows =
@@ -2102,12 +3564,16 @@ async function showAdminScheduleDay(
   for (const lesson of rows) {
     buttons.push([
       {
-        text: `✏️ Изменить №${lesson.lesson_number}`,
-        callback_data: `sch_edit_${lesson.id}`
+        text:
+          `✏️ Изменить №${lesson.lesson_number}`,
+        callback_data:
+          `sch_edit_${lesson.id}`
       },
       {
-        text: `🗑 Удалить`,
-        callback_data: `sch_delete_${lesson.id}`
+        text:
+          `🗑 Удалить`,
+        callback_data:
+          `sch_delete_${lesson.id}`
       }
     ]);
   }
@@ -2115,35 +3581,40 @@ async function showAdminScheduleDay(
   buttons.push([
     {
       text: "➕ Добавить пару",
-      callback_data: "sch_admin_add"
+      callback_data:
+        "sch_admin_add"
     }
   ]);
 
   buttons.push([
     {
       text: "📆 Исключение на дату",
-      callback_data: `sch_exception_${day}`
+      callback_data:
+        `sch_exception_${day}`
     }
   ]);
 
   buttons.push([
     {
       text: "📋 Исключения",
-      callback_data: `sch_exceptions_${day}`
+      callback_data:
+        `sch_exceptions_${day}`
     }
   ]);
 
   buttons.push([
     {
       text: "📋 Скопировать день",
-      callback_data: `sch_copy_${day}`
+      callback_data:
+        `sch_copy_${day}`
     }
   ]);
 
   buttons.push([
     {
       text: "◀️ К дням",
-      callback_data: "admin_schedule"
+      callback_data:
+        "admin_schedule"
     }
   ]);
 
@@ -2151,7 +3622,8 @@ async function showAdminScheduleDay(
     chat_id: chatId,
     text,
     reply_markup: {
-      inline_keyboard: buttons
+      inline_keyboard:
+        buttons
     }
   }, env);
 }
@@ -2166,7 +3638,14 @@ async function beginScheduleAdd(
   telegramId,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) return;
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
 
   await beginPendingInput(
     telegramId,
@@ -2199,15 +3678,26 @@ async function processScheduleAdd(
   text,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) {
-    await clearPendingInput(telegramId, env);
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    await clearPendingInput(
+      telegramId,
+      env
+    );
+
     return true;
   }
 
   const parts =
-    text.split("|").map(
-      x => x.trim()
-    );
+    text
+      .split("|")
+      .map(
+        x => x.trim()
+      );
 
   if (parts.length < 7) {
     await telegram("sendMessage", {
@@ -2236,10 +3726,14 @@ async function processScheduleAdd(
     parts[4];
 
   const teacher =
-    parts[5] === "-" ? null : parts[5];
+    parts[5] === "-"
+      ? null
+      : parts[5];
 
   const room =
-    parts[6] === "-" ? null : parts[6];
+    parts[6] === "-"
+      ? null
+      : parts[6];
 
   if (
     !Number.isInteger(day) ||
@@ -2336,13 +3830,15 @@ async function processScheduleAdd(
         [
           {
             text: "📅 Расписание",
-            callback_data: "admin_schedule"
+            callback_data:
+              "admin_schedule"
           }
         ],
         [
           {
             text: "◀️ Админ-панель",
-            callback_data: "admin"
+            callback_data:
+              "admin"
           }
         ]
       ]
@@ -2363,7 +3859,14 @@ async function beginScheduleEdit(
   id,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) return;
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
 
   const lesson =
     await env.DB.prepare(
@@ -2377,7 +3880,8 @@ async function beginScheduleEdit(
   if (!lesson) {
     await telegram("sendMessage", {
       chat_id: chatId,
-      text: "❗ Пара не найдена."
+      text:
+        "❗ Пара не найдена."
     }, env);
 
     return;
@@ -2411,15 +3915,26 @@ async function processScheduleEdit(
   state,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) {
-    await clearPendingInput(telegramId, env);
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    await clearPendingInput(
+      telegramId,
+      env
+    );
+
     return true;
   }
 
   const parts =
-    text.split("|").map(
-      x => x.trim()
-    );
+    text
+      .split("|")
+      .map(
+        x => x.trim()
+      );
 
   if (parts.length < 6) {
     await telegram("sendMessage", {
@@ -2445,10 +3960,14 @@ async function processScheduleEdit(
     parts[3];
 
   const teacher =
-    parts[4] === "-" ? null : parts[4];
+    parts[4] === "-"
+      ? null
+      : parts[4];
 
   const room =
-    parts[5] === "-" ? null : parts[5];
+    parts[5] === "-"
+      ? null
+      : parts[5];
 
   if (
     !Number.isInteger(lesson) ||
@@ -2460,7 +3979,8 @@ async function processScheduleEdit(
   ) {
     await telegram("sendMessage", {
       chat_id: message.chat.id,
-      text: "❗ Проверь номер пары и время."
+      text:
+        "❗ Проверь номер пары и время."
     }, env);
 
     return true;
@@ -2501,8 +4021,10 @@ async function processScheduleEdit(
       inline_keyboard: [
         [
           {
-            text: "📅 Управление расписанием",
-            callback_data: "admin_schedule"
+            text:
+              "📅 Управление расписанием",
+            callback_data:
+              "admin_schedule"
           }
         ]
       ]
@@ -2523,7 +4045,14 @@ async function deleteScheduleLesson(
   id,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) return;
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
 
   const lesson =
     await env.DB.prepare(
@@ -2554,7 +4083,8 @@ async function deleteScheduleLesson(
         [
           {
             text: "📅 Расписание",
-            callback_data: "admin_schedule"
+            callback_data:
+              "admin_schedule"
           }
         ]
       ]
@@ -2573,7 +4103,14 @@ async function beginScheduleException(
   day,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) return;
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
 
   await beginPendingInput(
     telegramId,
@@ -2588,8 +4125,7 @@ async function beginScheduleException(
     chat_id: chatId,
     text:
       `📆 Исключение на конкретную дату\n\n` +
-      `Это НЕ изменит обычное расписание.\n` +
-      `Изменение будет действовать только на выбранную дату.\n\n` +
+      `Это НЕ изменит обычное расписание.\n\n` +
       `Отправь:\n\n` +
       `ДД.ММ.ГГГГ | № | начало | конец | предмет | преподаватель | кабинет\n\n` +
       `Например:\n\n` +
@@ -2607,33 +4143,51 @@ async function processScheduleException(
   state,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) {
-    await clearPendingInput(telegramId, env);
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    await clearPendingInput(
+      telegramId,
+      env
+    );
+
     return true;
   }
 
   const parts =
-    text.split("|").map(
-      x => x.trim()
-    );
+    text
+      .split("|")
+      .map(
+        x => x.trim()
+      );
 
   if (
     parts.length === 3 &&
-    parts[2].toUpperCase() === "УДАЛИТЬ"
+    parts[2].toUpperCase() ===
+      "УДАЛИТЬ"
   ) {
     const date =
-      parseRussianDate(parts[0]);
+      parseRussianDate(
+        parts[0]
+      );
 
     const lesson =
       Number(parts[1]);
 
     if (
       !date ||
-      !Number.isInteger(lesson)
+      !Number.isInteger(
+        lesson
+      )
     ) {
       await telegram("sendMessage", {
-        chat_id: message.chat.id,
-        text: "❗ Проверь дату и номер пары."
+        chat_id:
+          message.chat.id,
+        text:
+          "❗ Проверь дату и номер пары."
       }, env);
 
       return true;
@@ -2662,7 +4216,8 @@ async function processScheduleException(
     );
 
     await telegram("sendMessage", {
-      chat_id: message.chat.id,
+      chat_id:
+        message.chat.id,
       text:
         `✅ Пара удалена только на ${formatDate(date)}.`
     }, env);
@@ -2672,7 +4227,8 @@ async function processScheduleException(
 
   if (parts.length < 7) {
     await telegram("sendMessage", {
-      chat_id: message.chat.id,
+      chat_id:
+        message.chat.id,
       text:
         `❗ Формат:\n\n` +
         `ДД.ММ.ГГГГ | № | начало | конец | предмет | преподаватель | кабинет`
@@ -2682,7 +4238,9 @@ async function processScheduleException(
   }
 
   const date =
-    parseRussianDate(parts[0]);
+    parseRussianDate(
+      parts[0]
+    );
 
   const lesson =
     Number(parts[1]);
@@ -2697,14 +4255,20 @@ async function processScheduleException(
     parts[4];
 
   const teacher =
-    parts[5] === "-" ? null : parts[5];
+    parts[5] === "-"
+      ? null
+      : parts[5];
 
   const room =
-    parts[6] === "-" ? null : parts[6];
+    parts[6] === "-"
+      ? null
+      : parts[6];
 
   if (
     !date ||
-    !Number.isInteger(lesson) ||
+    !Number.isInteger(
+      lesson
+    ) ||
     lesson < 1 ||
     lesson > 20 ||
     !isValidTime(start) ||
@@ -2712,8 +4276,10 @@ async function processScheduleException(
     !subject
   ) {
     await telegram("sendMessage", {
-      chat_id: message.chat.id,
-      text: "❗ Проверь дату, номер и время."
+      chat_id:
+        message.chat.id,
+      text:
+        "❗ Проверь дату, номер и время."
     }, env);
 
     return true;
@@ -2752,7 +4318,8 @@ async function processScheduleException(
   );
 
   await telegram("sendMessage", {
-    chat_id: message.chat.id,
+    chat_id:
+      message.chat.id,
     text:
       `✅ Расписание изменено только на ${formatDate(date)}.\n\n` +
       `📚 ${subject}\n` +
@@ -2774,7 +4341,14 @@ async function showScheduleExceptions(
   day,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) return;
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
 
   const result =
     await env.DB.prepare(
@@ -2785,8 +4359,9 @@ async function showScheduleExceptions(
          subject,
          action
        FROM schedule_exceptions
-       ORDER BY lesson_date ASC,
-                lesson_number ASC
+       ORDER BY
+         lesson_date ASC,
+         lesson_number ASC
        LIMIT 100`
     ).all();
 
@@ -2803,7 +4378,8 @@ async function showScheduleExceptions(
           [
             {
               text: "◀️ Назад",
-              callback_data: `sch_day_${day}`
+              callback_data:
+                `sch_day_${day}`
             }
           ]
         ]
@@ -2818,19 +4394,26 @@ async function showScheduleExceptions(
 
   const buttons = [];
 
-  for (const row of rows) {
+  for (
+    const row
+    of rows
+  ) {
     text +=
       `🆔 ${row.id}\n` +
       `📅 ${formatDate(row.lesson_date)}\n` +
       `🔢 Пара №${row.lesson_number}\n` +
-      `${row.action === "delete"
-        ? "🗑 Удалена"
-        : `📚 ${row.subject || "Изменена"}`}\n\n`;
+      `${
+        row.action === "delete"
+          ? "🗑 Удалена"
+          : `📚 ${row.subject || "Изменена"}`
+      }\n\n`;
 
     buttons.push([
       {
-        text: `🗑 Удалить исключение №${row.id}`,
-        callback_data: `sch_ex_delete_${row.id}`
+        text:
+          `🗑 Удалить исключение №${row.id}`,
+        callback_data:
+          `sch_ex_delete_${row.id}`
       }
     ]);
   }
@@ -2838,7 +4421,8 @@ async function showScheduleExceptions(
   buttons.push([
     {
       text: "◀️ Назад",
-      callback_data: `sch_day_${day}`
+      callback_data:
+        `sch_day_${day}`
     }
   ]);
 
@@ -2846,7 +4430,8 @@ async function showScheduleExceptions(
     chat_id: chatId,
     text,
     reply_markup: {
-      inline_keyboard: buttons
+      inline_keyboard:
+        buttons
     }
   }, env);
 }
@@ -2858,7 +4443,14 @@ async function deleteScheduleException(
   id,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) return;
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
 
   await env.DB.prepare(
     `DELETE FROM schedule_exceptions
@@ -2877,7 +4469,8 @@ async function deleteScheduleException(
         [
           {
             text: "📅 Расписание",
-            callback_data: "admin_schedule"
+            callback_data:
+              "admin_schedule"
           }
         ]
       ]
@@ -2896,7 +4489,14 @@ async function beginScheduleCopy(
   sourceDay,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) return;
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    return;
+  }
 
   await beginPendingInput(
     telegramId,
@@ -2928,8 +4528,17 @@ async function processScheduleCopy(
   state,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) {
-    await clearPendingInput(telegramId, env);
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
+    await clearPendingInput(
+      telegramId,
+      env
+    );
+
     return true;
   }
 
@@ -2937,15 +4546,20 @@ async function processScheduleCopy(
     Number(text);
 
   const sourceDay =
-    Number(state.data.sourceDay);
+    Number(
+      state.data.sourceDay
+    );
 
   if (
-    !Number.isInteger(targetDay) ||
+    !Number.isInteger(
+      targetDay
+    ) ||
     targetDay < 1 ||
     targetDay > 5
   ) {
     await telegram("sendMessage", {
-      chat_id: message.chat.id,
+      chat_id:
+        message.chat.id,
       text:
         `❗ Введи номер дня от 1 до 5.`
     }, env);
@@ -2953,9 +4567,13 @@ async function processScheduleCopy(
     return true;
   }
 
-  if (targetDay === sourceDay) {
+  if (
+    targetDay ===
+    sourceDay
+  ) {
     await telegram("sendMessage", {
-      chat_id: message.chat.id,
+      chat_id:
+        message.chat.id,
       text:
         `❗ Нельзя скопировать день сам в себя.`
     }, env);
@@ -2997,7 +4615,10 @@ async function processScheduleCopy(
     )
     .run();
 
-  for (const row of rows) {
+  for (
+    const row
+    of rows
+  ) {
     await env.DB.prepare(
       `INSERT INTO schedule
        (
@@ -3031,7 +4652,8 @@ async function processScheduleCopy(
   );
 
   await telegram("sendMessage", {
-    chat_id: message.chat.id,
+    chat_id:
+      message.chat.id,
     text:
       `✅ День скопирован!\n\n` +
       `${dayName(sourceDay)} → ${dayName(targetDay)}\n\n` +
@@ -3040,8 +4662,10 @@ async function processScheduleCopy(
       inline_keyboard: [
         [
           {
-            text: "📅 Управление расписанием",
-            callback_data: "admin_schedule"
+            text:
+              "📅 Управление расписанием",
+            callback_data:
+              "admin_schedule"
           }
         ]
       ]
@@ -3108,10 +4732,14 @@ async function getPendingInput(
       )
       .first();
 
-  if (!result) return null;
+  if (!result) {
+    return null;
+  }
 
   try {
-    return JSON.parse(result.value);
+    return JSON.parse(
+      result.value
+    );
   } catch {
     return null;
   }
@@ -3139,7 +4767,9 @@ async function handlePendingInput(
   }
 
   if (
-    state.action.startsWith("hw_add")
+    state.action.startsWith(
+      "hw_add"
+    )
   ) {
     return await processHomeworkAdd(
       message,
@@ -3151,7 +4781,9 @@ async function handlePendingInput(
   }
 
   if (
-    state.action.startsWith("hw_edit")
+    state.action.startsWith(
+      "hw_edit"
+    )
   ) {
     return await processHomeworkEdit(
       message,
@@ -3163,7 +4795,8 @@ async function handlePendingInput(
   }
 
   if (
-    state.action === "hw_copy"
+    state.action ===
+    "hw_copy"
   ) {
     return await processHomeworkCopy(
       message,
@@ -3175,7 +4808,8 @@ async function handlePendingInput(
   }
 
   if (
-    state.action === "schedule_add"
+    state.action ===
+    "schedule_add"
   ) {
     return await processScheduleAdd(
       message,
@@ -3186,7 +4820,8 @@ async function handlePendingInput(
   }
 
   if (
-    state.action === "schedule_edit"
+    state.action ===
+    "schedule_edit"
   ) {
     return await processScheduleEdit(
       message,
@@ -3198,7 +4833,8 @@ async function handlePendingInput(
   }
 
   if (
-    state.action === "schedule_exception"
+    state.action ===
+    "schedule_exception"
   ) {
     return await processScheduleException(
       message,
@@ -3210,7 +4846,8 @@ async function handlePendingInput(
   }
 
   if (
-    state.action === "schedule_copy"
+    state.action ===
+    "schedule_copy"
   ) {
     return await processScheduleCopy(
       message,
@@ -3234,7 +4871,12 @@ async function showAdminDuties(
   telegramId,
   env
 ) {
-  if (!(await isAdmin(telegramId, env))) {
+  if (
+    !(await isAdmin(
+      telegramId,
+      env
+    ))
+  ) {
     await telegram("sendMessage", {
       chat_id: chatId,
       text: "⛔ Нет доступа."
@@ -3263,81 +4905,24 @@ async function showAdminDuties(
   let text =
     `🧹 Дежурства\n\n`;
 
-  if (!result.results.length) {
+  const rows =
+    result.results || [];
+
+  if (!rows.length) {
     text +=
       `Дежурства не найдены.`;
   } else {
-    for (const duty of result.results) {
+    for (
+      const duty
+      of rows
+    ) {
       text +=
-        `📅 ${formatDate(duty.duty_date)} — пара №${duty.pair_number}\n` +
+        `📅 ${formatDate(duty.duty_date)} — ` +
+        `пара №${duty.pair_number}\n` +
         `👤 ${duty.student1 || "—"}\n` +
         `👤 ${duty.student2 || "—"}\n` +
         `Статус: ${duty.status}\n\n`;
     }
-  }
-
-  await telegram("sendMessage", {
-    chat_id: chatId,
-    text,
-    reply_markup: {
-      inline_keyboard: [
-        [
-          {
-            text: "◀️ Назад",
-            callback_data: "admin"
-          }
-        ]
-      ]
-    }
-  }, env);
-}
-
-
-/* =====================================================
-   ADMIN STUDENTS
-===================================================== */
-
-async function showAdminStudents(
-  chatId,
-  telegramId,
-  env
-) {
-  if (!(await isAdmin(telegramId, env))) {
-    await telegram("sendMessage", {
-      chat_id: chatId,
-      text: "⛔ Нет доступа."
-    }, env);
-
-    return;
-  }
-
-  const result =
-    await env.DB.prepare(
-      `SELECT
-         full_name,
-         username,
-         role,
-         telegram_id
-       FROM students
-       WHERE is_active = 1
-       ORDER BY full_name`
-    ).all();
-
-  let text =
-    `👥 Участники ПК-38\n\n` +
-    `Количество: ${result.results.length}\n\n`;
-
-  for (const student of result.results) {
-    const telegramStatus =
-      student.telegram_id
-        ? `🟢 ${student.telegram_id}`
-        : "⚪ Telegram не привязан";
-
-    text +=
-      `👤 ${student.full_name}\n` +
-      `🔹 ${student.username || "username нет"}\n` +
-      `🔹 ${student.role}\n` +
-      `${telegramStatus}\n\n`;
   }
 
   await telegram("sendMessage", {
@@ -3382,7 +4967,7 @@ async function showDuty(
       chat_id: chatId,
       text:
         `❗ Твой Telegram пока не привязан к группе.\n\n` +
-        `Используй /id и передай ID старосте.`,
+        `Нажми /start и попроси код у старосты.`,
       reply_markup: backMenu()
     }, env);
 
@@ -3460,7 +5045,9 @@ async function showDuty(
          FROM students
          WHERE id = ?`
       )
-        .bind(history.old_student_id)
+        .bind(
+          history.old_student_id
+        )
         .first();
 
     const newStudent =
@@ -3469,7 +5056,9 @@ async function showDuty(
          FROM students
          WHERE id = ?`
       )
-        .bind(history.new_student_id)
+        .bind(
+          history.new_student_id
+        )
         .first();
 
     text +=
@@ -3485,14 +5074,18 @@ async function showDuty(
       inline_keyboard: [
         [
           {
-            text: "🔄 Попросить замену",
-            callback_data: "replacement"
+            text:
+              "🔄 Попросить замену",
+            callback_data:
+              "replacement"
           }
         ],
         [
           {
-            text: "◀️ Назад",
-            callback_data: "back"
+            text:
+              "◀️ Назад",
+            callback_data:
+              "back"
           }
         ]
       ]
@@ -3517,7 +5110,10 @@ async function generateDuties(env) {
        ORDER BY pair_number`
     ).all();
 
-  if (!pairs.results.length) {
+  const pairRows =
+    pairs.results || [];
+
+  if (!pairRows.length) {
     console.error(
       "No active duty pairs found"
     );
@@ -3546,11 +5142,13 @@ async function generateDuties(env) {
       );
 
     nextPairNumber =
-      Number(lastDuty.pair_number) + 1;
+      Number(
+        lastDuty.pair_number
+      ) + 1;
 
     if (
       nextPairNumber >
-      pairs.results.length
+      pairRows.length
     ) {
       nextPairNumber = 1;
     }
@@ -3575,10 +5173,13 @@ async function generateDuties(env) {
   let generated = 0;
 
   while (
-    currentDate <= generationEnd
+    currentDate <=
+    generationEnd
   ) {
     const day =
-      getDayOfWeek(currentDate);
+      getDayOfWeek(
+        currentDate
+      );
 
     if (
       day !== 0 &&
@@ -3590,17 +5191,24 @@ async function generateDuties(env) {
            FROM calendar
            WHERE calendar_date = ?`
         )
-          .bind(currentDate)
+          .bind(
+            currentDate
+          )
           .first();
 
       const isCalendarDayOff =
         calendar &&
         (
-          calendar.status === "holiday" ||
-          calendar.status === "vacation" ||
-          calendar.status === "cancelled" ||
-          calendar.status === "weekend" ||
-          calendar.status === "day_off"
+          calendar.status ===
+            "holiday" ||
+          calendar.status ===
+            "vacation" ||
+          calendar.status ===
+            "cancelled" ||
+          calendar.status ===
+            "weekend" ||
+          calendar.status ===
+            "day_off"
         );
 
       if (!isCalendarDayOff) {
@@ -3610,14 +5218,18 @@ async function generateDuties(env) {
              FROM duties
              WHERE duty_date = ?`
           )
-            .bind(currentDate)
+            .bind(
+              currentDate
+            )
             .first();
 
         if (!existing) {
           const pair =
-            pairs.results.find(
+            pairRows.find(
               p =>
-                Number(p.pair_number) ===
+                Number(
+                  p.pair_number
+                ) ===
                 nextPairNumber
             );
 
@@ -3647,7 +5259,7 @@ async function generateDuties(env) {
 
             if (
               nextPairNumber >
-              pairs.results.length
+              pairRows.length
             ) {
               nextPairNumber = 1;
             }
@@ -3714,7 +5326,8 @@ async function sendDutyNotification(
       `SELECT value
        FROM settings
        WHERE key = 'group_chat_id'`
-    ).first();
+    )
+      .first();
 
   if (
     !setting ||
@@ -3728,7 +5341,9 @@ async function sendDutyNotification(
   }
 
   const duty =
-    await getTodayDuty(env);
+    await getTodayDuty(
+      env
+    );
 
   if (!duty) {
     return false;
@@ -3736,6 +5351,12 @@ async function sendDutyNotification(
 
   const today =
     getLocalDate();
+
+  let student1 =
+    duty.student1;
+
+  let student2 =
+    duty.student2;
 
   const history =
     await env.DB.prepare(
@@ -3750,12 +5371,6 @@ async function sendDutyNotification(
       .bind(duty.id)
       .first();
 
-  let student1 =
-    duty.student1;
-
-  let student2 =
-    duty.student2;
-
   let replacementText =
     "";
 
@@ -3766,7 +5381,9 @@ async function sendDutyNotification(
          FROM students
          WHERE id = ?`
       )
-        .bind(history.old_student_id)
+        .bind(
+          history.old_student_id
+        )
         .first();
 
     const newStudent =
@@ -3775,7 +5392,9 @@ async function sendDutyNotification(
          FROM students
          WHERE id = ?`
       )
-        .bind(history.new_student_id)
+        .bind(
+          history.new_student_id
+        )
         .first();
 
     if (
@@ -3807,7 +5426,10 @@ async function sendDutyNotification(
 
   let text;
 
-  if (type === "morning") {
+  if (
+    type ===
+    "morning"
+  ) {
     text =
       `☀️ ДОБРОЕ УТРО, ПК-38!\n\n` +
       `🧹 Сегодня дежурят:\n\n` +
@@ -3829,7 +5451,8 @@ async function sendDutyNotification(
     await telegram(
       "sendMessage",
       {
-        chat_id: setting.value,
+        chat_id:
+          setting.value,
         text
       },
       env
@@ -3843,9 +5466,13 @@ async function sendDutyNotification(
    SCHEDULED TASKS
 ===================================================== */
 
-async function runScheduledTasks(env) {
+async function runScheduledTasks(
+  env
+) {
   try {
-    await generateDuties(env);
+    await generateDuties(
+      env
+    );
 
     const now =
       getLocalTime();
@@ -3865,7 +5492,9 @@ async function runScheduledTasks(env) {
           env
         );
 
-      if (enabled !== "0") {
+      if (
+        enabled !== "0"
+      ) {
         const key =
           "last_morning_notification";
 
@@ -3880,7 +5509,8 @@ async function runScheduledTasks(env) {
 
         if (
           !setting ||
-          setting.value !== today
+          setting.value !==
+            today
         ) {
           const sent =
             await sendDutyNotification(
@@ -3916,7 +5546,9 @@ async function runScheduledTasks(env) {
           env
         );
 
-      if (enabled !== "0") {
+      if (
+        enabled !== "0"
+      ) {
         const key =
           "last_duty_reminder";
 
@@ -3931,7 +5563,8 @@ async function runScheduledTasks(env) {
 
         if (
           !setting ||
-          setting.value !== today
+          setting.value !==
+            today
         ) {
           const sent =
             await sendDutyNotification(
@@ -3981,7 +5614,8 @@ async function getSetting(
       .bind(key)
       .first();
 
-  return result?.value || null;
+  return result?.value ||
+    null;
 }
 
 
@@ -3994,28 +5628,39 @@ function getLocalDate() {
     new Intl.DateTimeFormat(
       "en-US",
       {
-        timeZone: TIMEZONE,
-        year: "numeric",
-        month: "2-digit",
-        day: "2-digit"
+        timeZone:
+          TIMEZONE,
+        year:
+          "numeric",
+        month:
+          "2-digit",
+        day:
+          "2-digit"
       }
-    ).formatToParts(
-      new Date()
-    );
+    )
+      .formatToParts(
+        new Date()
+      );
 
   const year =
     parts.find(
-      p => p.type === "year"
+      p =>
+        p.type ===
+        "year"
     ).value;
 
   const month =
     parts.find(
-      p => p.type === "month"
+      p =>
+        p.type ===
+        "month"
     ).value;
 
   const day =
     parts.find(
-      p => p.type === "day"
+      p =>
+        p.type ===
+        "day"
     ).value;
 
   return (
@@ -4029,26 +5674,35 @@ function getLocalTime() {
     new Intl.DateTimeFormat(
       "en-US",
       {
-        timeZone: TIMEZONE,
-        hour: "2-digit",
-        minute: "2-digit",
-        hour12: false
+        timeZone:
+          TIMEZONE,
+        hour:
+          "2-digit",
+        minute:
+          "2-digit",
+        hour12:
+          false
       }
-    ).formatToParts(
-      new Date()
-    );
+    )
+      .formatToParts(
+        new Date()
+      );
 
   let hour =
     Number(
       parts.find(
-        p => p.type === "hour"
+        p =>
+          p.type ===
+          "hour"
       ).value
     );
 
   const minute =
     Number(
       parts.find(
-        p => p.type === "minute"
+        p =>
+          p.type ===
+          "minute"
       ).value
     );
 
@@ -4108,7 +5762,8 @@ function addDays(
     );
 
   date.setUTCDate(
-    date.getUTCDate() + days
+    date.getUTCDate() +
+    days
   );
 
   return date
@@ -4137,15 +5792,21 @@ function formatDate(date) {
 }
 
 
-function parseRussianDate(value) {
-  if (!value) return null;
+function parseRussianDate(
+  value
+) {
+  if (!value) {
+    return null;
+  }
 
   const match =
     value.match(
       /^(\d{2})\.(\d{2})\.(\d{4})$/
     );
 
-  if (!match) return null;
+  if (!match) {
+    return null;
+  }
 
   const day =
     Number(match[1]);
@@ -4166,26 +5827,40 @@ function parseRussianDate(value) {
     );
 
   if (
-    date.getUTCFullYear() !== year ||
-    date.getUTCMonth() !== month - 1 ||
-    date.getUTCDate() !== day
+    date.getUTCFullYear() !==
+      year ||
+    date.getUTCMonth() !==
+      month - 1 ||
+    date.getUTCDate() !==
+      day
   ) {
     return null;
   }
 
   return (
-    `${year.toString().padStart(4, "0")}-` +
-    `${month.toString().padStart(2, "0")}-` +
-    `${day.toString().padStart(2, "0")}`
+    `${year
+      .toString()
+      .padStart(4, "0")}-` +
+    `${month
+      .toString()
+      .padStart(2, "0")}-` +
+    `${day
+      .toString()
+      .padStart(2, "0")}`
   );
 }
 
 
-function timeToMinutes(time) {
-  if (!time) return 0;
+function timeToMinutes(
+  time
+) {
+  if (!time) {
+    return 0;
+  }
 
   const parts =
-    time.split(":")
+    time
+      .split(":")
       .map(Number);
 
   return (
@@ -4195,9 +5870,13 @@ function timeToMinutes(time) {
 }
 
 
-function isValidTime(time) {
+function isValidTime(
+  time
+) {
   if (
-    !/^\d{2}:\d{2}$/.test(time)
+    !/^\d{2}:\d{2}$/.test(
+      time
+    )
   ) {
     return false;
   }
@@ -4206,7 +5885,8 @@ function isValidTime(time) {
     hour,
     minute
   ] =
-    time.split(":")
+    time
+      .split(":")
       .map(Number);
 
   return (
@@ -4227,7 +5907,10 @@ function dayName(day) {
     5: "Пятница"
   };
 
-  return names[day] || "Неизвестный день";
+  return (
+    names[day] ||
+    "Неизвестный день"
+  );
 }
 
 
@@ -4249,8 +5932,10 @@ async function adminPlaceholder(
       inline_keyboard: [
         [
           {
-            text: "◀️ В админ-панель",
-            callback_data: "admin"
+            text:
+              "◀️ В админ-панель",
+            callback_data:
+              "admin"
           }
         ]
       ]
@@ -4268,8 +5953,10 @@ function backMenu() {
     inline_keyboard: [
       [
         {
-          text: "◀️ Назад",
-          callback_data: "back"
+          text:
+            "◀️ Назад",
+          callback_data:
+            "back"
         }
       ]
     ]
