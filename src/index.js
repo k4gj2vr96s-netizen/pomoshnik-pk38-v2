@@ -4854,162 +4854,239 @@ async function handlePendingInput(
     );
   }
 
- if (pending.action === "replacement_reason") {
-  const reason = text.trim();
+  if (
+    state.action ===
+    "hw_copy"
+  ) {
+    return await processHomeworkCopy(
+      message,
+      telegramId,
+      text,
+      state,
+      env
+    );
+  }
 
-  if (!reason) {
-    await telegram("sendMessage", {
-      chat_id: message.chat.id,
-      text: "❌ Причина не может быть пустой.\n\nНапиши причину ещё раз."
-    }, env);
+  if (
+    state.action ===
+    "replacement_reason"
+  ) {
+    const reason =
+      text.trim();
+
+    if (!reason) {
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            message.chat.id,
+          text:
+            "❌ Причина не может быть пустой.\n\n" +
+            "Напиши причину ещё раз."
+        },
+        env
+      );
+
+      return true;
+    }
+
+    const dutyDate =
+      state.data.duty_date;
+
+    const replacementId =
+      Number(
+        state.data.replacement_id
+      );
+
+    const requester =
+      await env.DB.prepare(
+        `SELECT id, full_name
+         FROM students
+         WHERE telegram_id = ?`
+      )
+        .bind(telegramId)
+        .first();
+
+    if (!requester) {
+      await clearPendingInput(
+        telegramId,
+        env
+      );
+
+      return true;
+    }
+
+    const replacement =
+      await env.DB.prepare(
+        `SELECT id, full_name, telegram_id
+         FROM students
+         WHERE id = ?
+           AND is_active = 1`
+      )
+        .bind(replacementId)
+        .first();
+
+    if (!replacement) {
+      await clearPendingInput(
+        telegramId,
+        env
+      );
+
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            message.chat.id,
+          text:
+            "❌ Участник не найден.",
+          reply_markup:
+            backMenu()
+        },
+        env
+      );
+
+      return true;
+    }
+
+    const existing =
+      await env.DB.prepare(
+        `SELECT id
+         FROM replacements
+         WHERE duty_date = ?
+           AND requester_id = ?
+           AND status IN ('pending', 'accepted')`
+      )
+        .bind(
+          dutyDate,
+          requester.id
+        )
+        .first();
+
+    if (existing) {
+      await clearPendingInput(
+        telegramId,
+        env
+      );
+
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            message.chat.id,
+          text:
+            `⚠️ У тебя уже есть активная заявка на замену на ${formatDateRu(dutyDate)}.`,
+          reply_markup:
+            backMenu()
+        },
+        env
+      );
+
+      return true;
+    }
+
+    const result =
+      await env.DB.prepare(
+        `INSERT INTO replacements
+         (
+           duty_date,
+           requester_id,
+           replacement_id,
+           reason,
+           status
+         )
+         VALUES (?, ?, ?, ?, 'pending')`
+      )
+        .bind(
+          dutyDate,
+          requester.id,
+          replacement.id,
+          reason
+        )
+        .run();
+
+    await clearPendingInput(
+      telegramId,
+      env
+    );
+
+    const replacementRecordId =
+      result.meta?.last_row_id;
+
+    await telegram(
+      "sendMessage",
+      {
+        chat_id:
+          message.chat.id,
+        text:
+          `✅ Заявка на замену создана!\n\n` +
+          `📅 ${formatDateRu(dutyDate)}\n` +
+          `👤 Кто просит: ${requester.full_name}\n` +
+          `🔄 Кто заменяет: ${replacement.full_name}\n` +
+          `📝 Причина: ${reason}\n\n` +
+          `⏳ Ожидаем ответ от одногруппника.`,
+        reply_markup:
+          backMenu()
+      },
+      env
+    );
+
+    if (
+      replacement.telegram_id &&
+      replacementRecordId
+    ) {
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            replacement.telegram_id,
+          text:
+            `🔄 Тебе предложили замену!\n\n` +
+            `📅 Дата: ${formatDateRu(dutyDate)}\n` +
+            `👤 Просит замену: ${requester.full_name}\n` +
+            `📝 Причина: ${reason}\n\n` +
+            `Согласен выйти за одногруппника?`,
+          reply_markup: {
+            inline_keyboard: [
+              [
+                {
+                  text:
+                    "✅ Принять",
+                  callback_data:
+                    `replacement_accept_${replacementRecordId}`
+                },
+                {
+                  text:
+                    "❌ Отказать",
+                  callback_data:
+                    `replacement_reject_${replacementRecordId}`
+                }
+              ]
+            ]
+          }
+        },
+        env
+      );
+    } else {
+      await telegram(
+        "sendMessage",
+        {
+          chat_id:
+            message.chat.id,
+          text:
+            `⚠️ Заявка сохранена, но у выбранного участника не привязан Telegram.\n\n` +
+            `Он не сможет получить уведомление от бота.`
+        },
+        env
+      );
+    }
 
     return true;
   }
 
-  const dutyDate = pending.data.duty_date;
-  const replacementId = Number(
-    pending.data.replacement_id
-  );
-
-  const requester = await env.DB.prepare(
-    `SELECT id, full_name
-     FROM students
-     WHERE telegram_id = ?`
-  )
-    .bind(telegramId)
-    .first();
-
-  if (!requester) {
-    return true;
-  }
-
-  const replacement = await env.DB.prepare(
-    `SELECT id, full_name, telegram_id
-     FROM students
-     WHERE id = ?
-       AND is_active = 1`
-  )
-    .bind(replacementId)
-    .first();
-
-  if (!replacement) {
-    await clearPendingInput(telegramId, env);
-
-    await telegram("sendMessage", {
-      chat_id: message.chat.id,
-      text: "❌ Участник не найден.",
-      reply_markup: backMenu()
-    }, env);
-
-    return true;
-  }
-
-  const existing = await env.DB.prepare(
-    `SELECT id
-     FROM replacements
-     WHERE duty_date = ?
-       AND requester_id = ?
-       AND status IN ('pending', 'accepted')`
-  )
-    .bind(
-      dutyDate,
-      requester.id
-    )
-    .first();
-
-  if (existing) {
-    await clearPendingInput(telegramId, env);
-
-    await telegram("sendMessage", {
-      chat_id: message.chat.id,
-      text:
-        `⚠️ У тебя уже есть активная заявка на замену на ${formatDateRu(dutyDate)}.`,
-      reply_markup: backMenu()
-    }, env);
-
-    return true;
-  }
-
-  const result = await env.DB.prepare(
-    `INSERT INTO replacements
-     (
-       duty_date,
-       requester_id,
-       replacement_id,
-       reason,
-       status
-     )
-     VALUES (?, ?, ?, ?, 'pending')`
-  )
-    .bind(
-      dutyDate,
-      requester.id,
-      replacement.id,
-      reason
-    )
-    .run();
-
-  await clearPendingInput(telegramId, env);
-
-  const replacementRow = await env.DB.prepare(
-    `SELECT id
-     FROM replacements
-     WHERE rowid = last_insert_rowid()`
-  ).first();
-
-  const replacementRecordId =
-    replacementRow?.id || result.meta?.last_row_id;
-
-  await telegram("sendMessage", {
-    chat_id: message.chat.id,
-    text:
-      `✅ Заявка на замену создана!\n\n` +
-      `📅 ${formatDateRu(dutyDate)}\n` +
-      `👤 Кто просит: ${requester.full_name}\n` +
-      `🔄 Кто заменяет: ${replacement.full_name}\n` +
-      `📝 Причина: ${reason}\n\n` +
-      `⏳ Ожидаем ответ от одногруппника.`,
-    reply_markup: backMenu()
-  }, env);
-
-  if (replacement.telegram_id && replacementRecordId) {
-    await telegram("sendMessage", {
-      chat_id: replacement.telegram_id,
-      text:
-        `🔄 Тебе предложили замену!\n\n` +
-        `📅 Дата: ${formatDateRu(dutyDate)}\n` +
-        `👤 Просит замену: ${requester.full_name}\n` +
-        `📝 Причина: ${reason}\n\n` +
-        `Согласен выйти за одногруппника?`,
-      reply_markup: {
-        inline_keyboard: [
-          [
-            {
-              text: "✅ Принять",
-              callback_data:
-                `replacement_accept_${replacementRecordId}`
-            },
-            {
-              text: "❌ Отказать",
-              callback_data:
-                `replacement_reject_${replacementRecordId}`
-            }
-          ]
-        ]
-      }
-    }, env);
-  } else {
-    await telegram("sendMessage", {
-      chat_id: chatId,
-      text:
-        `⚠️ Заявка сохранена, но у выбранного участника ` +
-        `не привязан Telegram.\n\n` +
-        `Он не сможет получить уведомление от бота.`
-    }, env);
-  }
-
-  return true;
-}
+  if (
+    state.action ===
+    "schedule_add"
+  ) {
     return await processScheduleAdd(
       message,
       telegramId,
@@ -5059,7 +5136,6 @@ async function handlePendingInput(
 
   return false;
 }
-
 
 /* =====================================================
    ADMIN DUTIES
