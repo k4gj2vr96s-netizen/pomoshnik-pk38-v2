@@ -6161,3 +6161,104 @@ function backMenu() {
     ]
   };
 }
+async function beginReplacement(
+  chatId,
+  telegramId,
+  env
+) {
+  const student = await env.DB.prepare(
+    `SELECT id, full_name
+     FROM students
+     WHERE telegram_id = ?`
+  )
+    .bind(telegramId)
+    .first();
+
+  if (!student) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text:
+        `❌ Сначала привяжи свой Telegram к участнику группы.`,
+      reply_markup: backMenu()
+    }, env);
+
+    return;
+  }
+
+  const duty = await env.DB.prepare(
+    `SELECT
+       id,
+       duty_date,
+       student1_id,
+       student2_id,
+       status
+     FROM duties
+     WHERE duty_date >= date('now', 'localtime')
+       AND status = 'scheduled'
+       AND (
+         student1_id = ?
+         OR student2_id = ?
+       )
+     ORDER BY duty_date ASC
+     LIMIT 1`
+  )
+    .bind(student.id, student.id)
+    .first();
+
+  if (!duty) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text:
+        `🧹 У тебя сейчас нет ближайшего запланированного дежурства, для которого можно запросить замену.`,
+      reply_markup: backMenu()
+    }, env);
+
+    return;
+  }
+
+  const partnerId =
+    Number(duty.student1_id) === Number(student.id)
+      ? duty.student2_id
+      : duty.student1_id;
+
+  const students = await env.DB.prepare(
+    `SELECT id, full_name
+     FROM students
+     WHERE is_active = 1
+       AND id != ?
+       AND id != ?
+     ORDER BY full_name`
+  )
+    .bind(student.id, partnerId)
+    .all();
+
+  const buttons = [];
+
+  for (const person of students.results || []) {
+    buttons.push([
+      {
+        text: person.full_name,
+        callback_data:
+          `replacement_select_${person.id}`
+      }
+    ]);
+  }
+
+  buttons.push([
+    {
+      text: "◀️ Назад",
+      callback_data: "duty"
+    }
+  ]);
+
+  await telegram("sendMessage", {
+    chat_id: chatId,
+    text:
+      `🔄 Попросить замену\n\n` +
+      `📅 Дата дежурства: ${formatDateRu(duty.duty_date)}\n\n` +
+      `Выбери человека, которого хочешь попросить выйти за тебя:`,
+    reply_markup: {
+      inline_keyboard: buttons
+    }
+  }, env);
+}
