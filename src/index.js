@@ -6262,3 +6262,410 @@ async function beginReplacement(
     }
   }, env);
 }
+async function selectReplacementPerson(
+  chatId,
+  telegramId,
+  replacementId,
+  env
+) {
+  const student = await env.DB.prepare(
+    `SELECT id, full_name
+     FROM students
+     WHERE telegram_id = ?`
+  )
+    .bind(telegramId)
+    .first();
+
+  if (!student) {
+    return;
+  }
+
+  const duty = await env.DB.prepare(
+    `SELECT
+       id,
+       duty_date,
+       student1_id,
+       student2_id
+     FROM duties
+     WHERE duty_date >= date('now', 'localtime')
+       AND status = 'scheduled'
+       AND (
+         student1_id = ?
+         OR student2_id = ?
+       )
+     ORDER BY duty_date ASC
+     LIMIT 1`
+  )
+    .bind(student.id, student.id)
+    .first();
+
+  if (!duty) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text: "❌ Ближайшее дежурство не найдено.",
+      reply_markup: backMenu()
+    }, env);
+
+    return;
+  }
+
+  const replacement = await env.DB.prepare(
+    `SELECT id, full_name
+     FROM students
+     WHERE id = ?
+       AND is_active = 1`
+  )
+    .bind(replacementId)
+    .first();
+
+  if (!replacement) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text: "❌ Участник не найден.",
+      reply_markup: backMenu()
+    }, env);
+
+    return;
+  }
+
+  await beginPendingInput(
+    telegramId,
+    "replacement_reason",
+    {
+      duty_date: duty.duty_date,
+      replacement_id: replacement.id
+    },
+    env
+  );
+
+  await telegram("sendMessage", {
+    chat_id: chatId,
+    text:
+      `🔄 Замена на ${formatDateRu(duty.duty_date)}\n\n` +
+      `👤 Заменить тебя должен:\n${replacement.full_name}\n\n` +
+      `📝 Теперь напиши причину, почему тебе нужна замена.\n\n` +
+      `Например: заболел, не смогу прийти, семейные обстоятельства.\n\n` +
+      `Для отмены: /cancel`
+  }, env);
+}
+async function answerReplacement(
+  chatId,
+  telegramId,
+  replacementId,
+  accepted,
+  env
+) {
+  const student = await env.DB.prepare(
+    `SELECT id, full_name
+     FROM students
+     WHERE telegram_id = ?`
+  )
+    .bind(telegramId)
+    .first();
+
+  if (!student) {
+    return;
+  }
+
+  const replacement = await env.DB.prepare(
+    `SELECT
+       r.*,
+       requester.full_name AS requester_name,
+       replacement.full_name AS replacement_name,
+       requester.telegram_id AS requester_telegram_id
+     FROM replacements r
+     JOIN students requester
+       ON requester.id = r.requester_id
+     JOIN students replacement
+       ON replacement.id = r.replacement_id
+     WHERE r.id = ?
+       AND r.replacement_id = ?`
+  )
+    .bind(replacementId, student.id)
+    .first();
+
+  if (!replacement) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text: "❌ Заявка не найдена или она адресована не тебе.",
+      reply_markup: backMenu()
+    }, env);
+
+    return;
+  }
+
+  if (replacement.status !== "pending") {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text:
+        `ℹ️ Эта заявка уже обработана.\n\n` +
+        `Статус: ${replacement.status}`,
+      reply_markup: backMenu()
+    }, env);
+
+    return;
+  }
+
+  const newStatus = accepted
+    ? "accepted"
+    : "rejected";
+
+  await env.DB.prepare(
+    `UPDATE replacements
+     SET status = ?,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`
+  )
+    .bind(newStatus, replacementId)
+    .run();
+
+  if (!accepted) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text:
+        `❌ Ты отказался от замены.\n\n` +
+        `Заявка отменена.`,
+      reply_markup: backMenu()
+    }, env);
+
+    if (replacement.requester_telegram_id) {
+      await telegram("sendMessage", {
+        chat_id: replacement.requester_telegram_id,
+        text:
+          `❌ ${student.full_name} отказался заменить тебя ` +
+          `на ${formatDateRu(replacement.duty_date)}.`
+      }, env);
+    }
+
+    return;
+  }
+
+  await telegram("sendMessage", {
+    chat_id: chatId,
+    text:
+      `✅ Ты согласился на замену.\n\n` +
+      `⏳ Теперь заявка отправлена старосте или заместителю на подтверждение.`,
+    reply_markup: backMenu()
+  }, env);
+
+  if (replacement.requester_telegram_id) {
+    await telegram("sendMessage", {
+      chat_id: replacement.requester_telegram_id,
+      text:
+        `✅ ${student.full_name} согласился тебя заменить!\n\n` +
+        `⏳ Теперь ждём подтверждение старосты или заместителя.`
+    }, env);
+  }
+
+  await notifyAdminsAboutReplacement(
+    replacementId,
+    env
+  );
+}
+async function notifyAdminsAboutReplacement(
+  replacementId,
+  env
+) {
+  const replacement = await env.DB.prepare(
+    `SELECT
+       r.*,
+       requester.full_name AS requester_name,
+       replacement.full_name AS replacement_name
+     FROM replacements r
+     JOIN students requester
+       ON requester.id = r.requester_id
+     JOIN students replacement
+       ON replacement.id = r.replacement_id
+     WHERE r.id = ?`
+  )
+    .bind(replacementId)
+    .first();
+
+  if (!replacement) return;
+
+  const admins = await env.DB.prepare(
+    `SELECT telegram_id
+     FROM students
+     WHERE role IN ('admin', 'deputy')
+       AND telegram_id IS NOT NULL
+       AND is_active = 1`
+  ).all();
+
+  for (const admin of admins.results || []) {
+    await telegram("sendMessage", {
+      chat_id: admin.telegram_id,
+      text:
+        `🔄 Новая заявка на замену\n\n` +
+        `📅 ${formatDateRu(replacement.duty_date)}\n` +
+        `👤 Просит замену: ${replacement.requester_name}\n` +
+        `🔄 Заменяет: ${replacement.replacement_name}\n` +
+        `📝 Причина: ${replacement.reason}\n\n` +
+        `Участник согласился. Требуется подтверждение.`,
+      reply_markup: {
+        inline_keyboard: [
+          [
+            {
+              text: "✅ Одобрить",
+              callback_data:
+                `replacement_approve_${replacement.id}`
+            }
+          ]
+        ]
+      }
+    }, env);
+  }
+}
+async function approveReplacement(
+  chatId,
+  telegramId,
+  replacementId,
+  env
+) {
+  if (!(await isAdmin(telegramId, env))) {
+    return;
+  }
+
+  const replacement = await env.DB.prepare(
+    `SELECT
+       r.*,
+       requester.full_name AS requester_name,
+       requester.telegram_id AS requester_telegram_id,
+       replacement.full_name AS replacement_name,
+       replacement.telegram_id AS replacement_telegram_id
+     FROM replacements r
+     JOIN students requester
+       ON requester.id = r.requester_id
+     JOIN students replacement
+       ON replacement.id = r.replacement_id
+     WHERE r.id = ?`
+  )
+    .bind(replacementId)
+    .first();
+
+  if (!replacement) {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text: "❌ Заявка не найдена.",
+      reply_markup: backMenu()
+    }, env);
+
+    return;
+  }
+
+  if (replacement.status !== "accepted") {
+    await telegram("sendMessage", {
+      chat_id: chatId,
+      text:
+        `⚠️ Эту заявку нельзя одобрить.\n\n` +
+        `Текущий статус: ${replacement.status}`,
+      reply_markup: backMenu()
+    }, env);
+
+    return;
+  }
+
+  await env.DB.prepare(
+    `UPDATE replacements
+     SET status = 'approved',
+         approved_by = ?,
+         updated_at = CURRENT_TIMESTAMP
+     WHERE id = ?`
+  )
+    .bind(telegramId, replacementId)
+    .run();
+
+  /*
+     Меняем фактического дежурного только после
+     окончательного одобрения админом.
+  */
+  const duty = await env.DB.prepare(
+    `SELECT *
+     FROM duties
+     WHERE duty_date = ?`
+  )
+    .bind(replacement.duty_date)
+    .first();
+
+  if (duty) {
+    let updateQuery = null;
+
+    if (
+      Number(duty.student1_id) ===
+      Number(replacement.requester_id)
+    ) {
+      updateQuery =
+        `UPDATE duties
+         SET student1_id = ?
+         WHERE id = ?`;
+    } else if (
+      Number(duty.student2_id) ===
+      Number(replacement.requester_id)
+    ) {
+      updateQuery =
+        `UPDATE duties
+         SET student2_id = ?
+         WHERE id = ?`;
+    }
+
+    if (updateQuery) {
+      await env.DB.prepare(updateQuery)
+        .bind(
+          replacement.replacement_id,
+          duty.id
+        )
+        .run();
+
+      await env.DB.prepare(
+        `INSERT INTO duty_history
+         (
+           duty_id,
+           old_student_id,
+           new_student_id,
+           reason,
+           changed_by
+         )
+         VALUES (?, ?, ?, ?, ?)`
+      )
+        .bind(
+          duty.id,
+          replacement.requester_id,
+          replacement.replacement_id,
+          replacement.reason,
+          telegramId
+        )
+        .run();
+    }
+  }
+
+  await telegram("sendMessage", {
+    chat_id: chatId,
+    text:
+      `✅ Замена одобрена!\n\n` +
+      `📅 ${formatDateRu(replacement.duty_date)}\n` +
+      `👤 ${replacement.requester_name}\n` +
+      `🔄 ${replacement.replacement_name}\n\n` +
+      `Теперь замена считается официальной.`,
+    reply_markup: backMenu()
+  }, env);
+
+  if (replacement.requester_telegram_id) {
+    await telegram("sendMessage", {
+      chat_id: replacement.requester_telegram_id,
+      text:
+        `🎉 Замена подтверждена!\n\n` +
+        `📅 ${formatDateRu(replacement.duty_date)}\n` +
+        `🔄 Тебя заменит ${replacement.replacement_name}.\n\n` +
+        `Староста подтвердил замену.`
+    }, env);
+  }
+
+  if (replacement.replacement_telegram_id) {
+    await telegram("sendMessage", {
+      chat_id: replacement.replacement_telegram_id,
+      text:
+        `✅ Замена официально подтверждена!\n\n` +
+        `📅 ${formatDateRu(replacement.duty_date)}\n` +
+        `Теперь ты дежуришь вместо ${replacement.requester_name}.`
+    }, env);
+  }
+}
