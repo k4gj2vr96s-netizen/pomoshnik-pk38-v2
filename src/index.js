@@ -593,16 +593,76 @@ async function handleCallback(
   /* ---------- OTHER ---------- */
 
   if (data === "replacement") {
-    await telegram("sendMessage", {
-      chat_id: chatId,
-      text:
-        `🔄 Попросить замену\n\n` +
-        `Функция замены будет подключена следующим этапом.`,
-      reply_markup: backMenu()
-    }, env);
+  await beginReplacement(
+    chatId,
+    telegramId,
+    env
+  );
 
-    return;
-  }
+  return;
+}
+
+if (data.startsWith("replacement_select_")) {
+  const replacementId = Number(
+    data.replace("replacement_select_", "")
+  );
+
+  await selectReplacementPerson(
+    chatId,
+    telegramId,
+    replacementId,
+    env
+  );
+
+  return;
+}
+
+if (data.startsWith("replacement_accept_")) {
+  const replacementId = Number(
+    data.replace("replacement_accept_", "")
+  );
+
+  await answerReplacement(
+    chatId,
+    telegramId,
+    replacementId,
+    true,
+    env
+  );
+
+  return;
+}
+
+if (data.startsWith("replacement_reject_")) {
+  const replacementId = Number(
+    data.replace("replacement_reject_", "")
+  );
+
+  await answerReplacement(
+    chatId,
+    telegramId,
+    replacementId,
+    false,
+    env
+  );
+
+  return;
+}
+
+if (data.startsWith("replacement_approve_")) {
+  const replacementId = Number(
+    data.replace("replacement_approve_", "")
+  );
+
+  await approveReplacement(
+    chatId,
+    telegramId,
+    replacementId,
+    env
+  );
+
+  return;
+}
 
   if (data === "late") {
     await telegram("sendMessage", {
