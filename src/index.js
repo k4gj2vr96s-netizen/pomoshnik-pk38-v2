@@ -2982,7 +2982,23 @@ async function processHomeworkAdd(
         telegramId
       )
       .run();
+     
+const homeworkChannelText =
+  `📚 ДОМАШНЕЕ ЗАДАНИЕ\n\n` +
+  `📅 ${formatDate(state.data.date)}\n` +
+  `📚 ${state.data.subject}\n\n` +
+  `📝 ${state.data.homeworkText}\n\n` +
+  `${
+    lesson === 0
+      ? ""
+      : `🔢 Пара №${lesson}\n\n`
+  }` +
+  `#ДЗ`;
 
+await publishToChannel(
+  homeworkChannelText,
+  env
+);
     await clearPendingInput(
       telegramId,
       env
