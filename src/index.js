@@ -752,27 +752,7 @@ if (data.startsWith("replacement_approve_")) {
 
     return;
   }
-
-const channelPublished =
-  await publishToChannel(
-    `📢 ОБЪЯВЛЕНИЕ\n\n` +
-    `${announcementText}\n\n` +
-    `#ОБЪЯВЛЕНИЯ`,
-    env
-  );
-
-    return;
-  }
-
-  if (data === "back") {
-    await showMainMenu(
-      chatId,
-      telegramId,
-      env
-    );
-
-    return;
-  }
+}
 
   /* ===================================================
      ADMIN
