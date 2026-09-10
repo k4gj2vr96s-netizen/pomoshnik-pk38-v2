@@ -160,7 +160,38 @@ async function handleMessage(message, env) {
     env
   );
 }
+/* =====================================================
+   CHANNEL
+===================================================== */
 
+async function handleChannelPost(message, env) {
+  if (!message || !message.chat) return;
+
+  if (message.chat.type !== "channel") {
+    return;
+  }
+
+  const channelId = String(message.chat.id);
+  const channelTitle = message.chat.title || "ПК-38";
+
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO settings (key, value)
+     VALUES ('channel_chat_id', ?)`
+  )
+    .bind(channelId)
+    .run();
+
+  await env.DB.prepare(
+    `INSERT OR REPLACE INTO settings (key, value)
+     VALUES ('channel_title', ?)`
+  )
+    .bind(channelTitle)
+    .run();
+
+  console.log(
+    `CHANNEL CONNECTED: ${channelTitle} (${channelId})`
+  );
+}
 
 /* =====================================================
    START
