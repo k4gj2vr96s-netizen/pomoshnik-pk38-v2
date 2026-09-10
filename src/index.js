@@ -186,6 +186,27 @@ async function handleChannelPost(message, env) {
      VALUES ('channel_title', ?)`
   )
     .bind(channelTitle)
+         )
+    .run();
+
+const homeworkChannelText =
+  `📚 ДОМАШНЕЕ ЗАДАНИЕ\n\n` +
+  `📅 ${formatDate(state.data.date)}\n` +
+  `📚 ${state.data.subject}\n\n` +
+  `📝 ${state.data.homeworkText}\n\n` +
+  `${
+    lesson === 0
+      ? ""
+      : `🔢 Пара №${lesson}\n\n`
+  }` +
+  `#ДЗ`;
+
+await publishToChannel(
+  homeworkChannelText,
+  env
+);
+
+await clearPendingInput(
     .run();
 
   console.log(
