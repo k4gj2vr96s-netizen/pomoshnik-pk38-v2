@@ -192,7 +192,35 @@ async function handleChannelPost(message, env) {
     `CHANNEL CONNECTED: ${channelTitle} (${channelId})`
   );
 }
+async function publishToChannel(text, env) {
+  const channelId =
+    await getSetting("channel_chat_id", env);
 
+  if (!channelId) {
+    console.log("CHANNEL NOT CONNECTED YET");
+    return false;
+  }
+
+  const result = await telegram(
+    "sendMessage",
+    {
+      chat_id: channelId,
+      text: text
+    },
+    env
+  );
+
+  if (!result.ok) {
+    console.error(
+      "CHANNEL SEND ERROR:",
+      result.description
+    );
+
+    return false;
+  }
+
+  return true;
+}
 /* =====================================================
    START
 ===================================================== */
