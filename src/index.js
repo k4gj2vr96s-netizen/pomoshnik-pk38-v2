@@ -1253,6 +1253,7 @@ if (data.startsWith("replacement_approve_")) {
 
     return;
   }
+}
 
 /* =====================================================
    TODAY
