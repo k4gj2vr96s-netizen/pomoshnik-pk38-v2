@@ -753,14 +753,13 @@ if (data.startsWith("replacement_approve_")) {
     return;
   }
 
-  if (data === "announcements") {
-    await telegram("sendMessage", {
-      chat_id: chatId,
-      text:
-        `📢 Объявления\n\n` +
-        `Пока опубликованных объявлений нет.`,
-      reply_markup: backMenu()
-    }, env);
+const channelPublished =
+  await publishToChannel(
+    `📢 ОБЪЯВЛЕНИЕ\n\n` +
+    `${announcementText}\n\n` +
+    `#ОБЪЯВЛЕНИЯ`,
+    env
+  );
 
     return;
   }
