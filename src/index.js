@@ -28,10 +28,14 @@ export default {
       const update = await request.json();
 
       if (update.message) {
-        await handleMessage(update.message, env);
-      }
+  await handleMessage(update.message, env);
+}
 
-      if (update.callback_query) {
+if (update.channel_post) {
+  await handleChannelPost(update.channel_post, env);
+}
+
+if (update.callback_query) {
         await handleCallback(update.callback_query, env);
       }
 
